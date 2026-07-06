@@ -173,29 +173,41 @@ def get_data():
     # ===== CPU 进程 TOP (带线程数) =====
     proc_raw = adb(["ps -A -o '%CPU,TCNT,ARGS' --sort=-%cpu".replace("'", '"')])
     data["top_procs"] = []
-    for line in proc_raw.split("\n")[1:16]:
+    seen_cpu = set()
+    for line in proc_raw.split("\n")[1:]:
+        if len(data["top_procs"]) >= 15:
+            break
         parts = line.strip().split(None, 2)
         if len(parts) >= 3:
             try:
-                cpu = float(parts[0])
-                tcnt = int(parts[1])
                 name = parts[2][:40]
                 pkg = parts[2].split(":")[0].split("/")[0].strip()[:50]
+                if pkg in seen_cpu:
+                    continue
+                seen_cpu.add(pkg)
+                cpu = float(parts[0])
+                tcnt = int(parts[1])
                 data["top_procs"].append({"cpu": cpu, "tcnt": tcnt, "name": name, "pkg": pkg})
             except: pass
 
     # ===== 内存进程 TOP (带线程数) =====
     mem_proc_raw = adb(["ps -A -o '%MEM,RSS,TCNT,ARGS' --sort=-%mem".replace("'", '"')])
     data["top_mem_procs"] = []
-    for line in mem_proc_raw.split("\n")[1:16]:
+    seen_mem = set()
+    for line in mem_proc_raw.split("\n")[1:]:
+        if len(data["top_mem_procs"]) >= 15:
+            break
         parts = line.strip().split(None, 3)
         if len(parts) >= 4:
             try:
+                name = parts[3][:40]
+                pkg = parts[3].split(":")[0].split("/")[0].strip()[:50]
+                if pkg in seen_mem:
+                    continue
+                seen_mem.add(pkg)
                 mem_pct = float(parts[0])
                 rss = round(int(parts[1]) / 1024, 0)
                 tcnt = int(parts[2])
-                name = parts[3][:40]
-                pkg = parts[3].split(":")[0].split("/")[0].strip()[:50]
                 data["top_mem_procs"].append({"mem_pct": mem_pct, "rss": rss, "tcnt": tcnt, "name": name, "pkg": pkg})
             except: pass
 
