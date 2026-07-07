@@ -1042,7 +1042,7 @@ function checkAlerts(topProcs) {
 
 function drawChart(history, canvasId, key, color, label, maxVal) {
     let c = document.getElementById(canvasId); if (!c) return;
-    let ctx = c.getContext('2d'), W = c.parentElement.clientWidth, H = 90;
+    let ctx = c.getContext('2d'), W = Math.max(c.parentElement.clientWidth, 200), H = 90;
     c.width = W*2; c.height = H*2; c.style.width = W+'px'; c.style.height = H+'px'; ctx.scale(2,2);
     ctx.fillStyle = '#161b22'; ctx.fillRect(0,0,W,H);
     if (history.length < 2) return;
@@ -1403,6 +1403,7 @@ function load(){
         if(currentTab==='dashboard' && dashFirstPaint){renderDash(d);dashFirstPaint=false;}
     }).catch(()=>{failCount++;if(failCount>=3)document.getElementById("dash").innerHTML="ADB连接失败，请检查手机连接";});
     fetch("/data").then(r=>r.json()).then(d=>{
+        if(!d || typeof d !== 'object') return;
         history.push(d);if(history.length>MAX_HISTORY)history.shift();
         checkAlerts(d.top_procs);
         if(currentTab==='dashboard'){
@@ -1418,7 +1419,7 @@ function load(){
             drawChart(history,'chart_temp','temp','#FF9800','温度',50);
             drawChart(history,'chart_discharge','discharge_ma','#FF9800','放电',Math.max(500,...history.map(d=>d.discharge_ma||0)));
         }
-    });
+    }).catch(()=>{failCount++;if(failCount>=3)document.getElementById("dash").innerHTML="ADB连接失败，请检查手机连接";});
 }
 load();setInterval(load,__INTERVAL__);
 </script>
