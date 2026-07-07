@@ -35,7 +35,7 @@ def save_mode():
 # ======================= 全局状态 =======================
 prev_stat = {}
 prev_stat_lock = threading.Lock()
-_ps_cache = {"proc_raw": "", "ts": 0}   # 监控模式 ps 缓存
+
 
 # 充电曲线
 charge_session = {"active": False, "points": [], "start_time": "", "start_level": 0}
@@ -116,49 +116,51 @@ def get_wakeup_sources():
 
 
 def get_data():
-    global prev_stat, _ps_cache
+    global prev_stat
     data = {"time": time.strftime("%H:%M:%S"), "timestamp": time.time()}
 
-    # 监控模式：ps 每 3 轮（6秒）刷新一次，其余用缓存
     if MODE == "monitor":
-        now_ts = time.time()
-        if _ps_cache["ts"] and now_ts - _ps_cache["ts"] < 6:
-            proc_raw = _ps_cache["proc_raw"]
-            proc_cached = True
-        else:
-            proc_cached = False
-
-    workers = 1 if MODE == "monitor" else 8
-    with ThreadPoolExecutor(max_workers=workers) as ex:
-        f_bat = ex.submit(adb, ["dumpsys", "battery"])
-        f_batt_sys = ex.submit(adb, ["cat", "/sys/class/power_supply/battery/voltage_now",
+        # ===== 监控模式：V4 风格直接顺序调用 adb()，无 ThreadPoolExecutor =====
+        # 关键差异: 无 executor 提交/收集开销，每条命令间有自然 Python 语句间隙
+        # ps 使用带引号的单字符串格式，防止 shell 解释 %（V4 做法）
+        bat = adb(["dumpsys", "battery"])
+        batt_sys = adb(["cat", "/sys/class/power_supply/battery/voltage_now",
             "/sys/class/power_supply/battery/current_now", "/sys/class/power_supply/battery/charge_type"])
-        f_thermal = ex.submit(adb, ["cat /sys/class/thermal/thermal_zone*/temp 2>/dev/null"])
-        f_meminfo = ex.submit(adb, ["cat", "/proc/meminfo"])
-        f_df = ex.submit(adb, ["df", "-h", "/data"])
-        f_stat = ex.submit(adb, ["cat", "/proc/stat"])
-        f_cpuinfo = ex.submit(adb, ["cat", "/proc/cpuinfo"])
-        f_freq = ex.submit(adb, ["cat /sys/devices/system/cpu/cpu*/cpufreq/scaling_cur_freq 2>/dev/null"])
-        f_fg = ex.submit(adb, ["dumpsys", "activity", "activities"])
-        if MODE == "monitor" and proc_cached:
-            f_ps = None   # 跳过 ps
-        else:
+        zones = adb(["cat /sys/class/thermal/thermal_zone*/temp 2>/dev/null"])
+        mem_raw = adb(["cat", "/proc/meminfo"])
+        df_raw = adb(["df", "-h", "/data"])
+        stat_raw = adb(["cat", "/proc/stat"])
+        cpuinfo = adb(["cat", "/proc/cpuinfo"])
+        freq_raw = adb(["cat /sys/devices/system/cpu/cpu*/cpufreq/scaling_cur_freq 2>/dev/null"])
+        fg_raw = adb(["dumpsys", "activity", "activities"])
+        proc_raw = adb(["ps -A -o \"%CPU,%MEM,RSS,TCNT,ARGS\""])
+        wm_raw = adb(["dumpsys", "window", "policy"])
+        display_raw = adb(["dumpsys", "display"])
+        wl_raw = adb(["dumpsys", "power"])
+    else:
+        # ===== 测试模式：并行 ThreadPoolExecutor =====
+        with ThreadPoolExecutor(max_workers=8) as ex:
+            f_bat = ex.submit(adb, ["dumpsys", "battery"])
+            f_batt_sys = ex.submit(adb, ["cat", "/sys/class/power_supply/battery/voltage_now",
+                "/sys/class/power_supply/battery/current_now", "/sys/class/power_supply/battery/charge_type"])
+            f_thermal = ex.submit(adb, ["cat /sys/class/thermal/thermal_zone*/temp 2>/dev/null"])
+            f_meminfo = ex.submit(adb, ["cat", "/proc/meminfo"])
+            f_df = ex.submit(adb, ["df", "-h", "/data"])
+            f_stat = ex.submit(adb, ["cat", "/proc/stat"])
+            f_cpuinfo = ex.submit(adb, ["cat", "/proc/cpuinfo"])
+            f_freq = ex.submit(adb, ["cat /sys/devices/system/cpu/cpu*/cpufreq/scaling_cur_freq 2>/dev/null"])
+            f_fg = ex.submit(adb, ["dumpsys", "activity", "activities"])
             f_ps = ex.submit(adb, ["ps", "-A", "-o", "%CPU,%MEM,RSS,TCNT,ARGS"])
-        f_wm = ex.submit(adb, ["dumpsys", "window", "policy"])
-        f_display = ex.submit(adb, ["dumpsys", "display"])
-        f_power = ex.submit(adb, ["dumpsys", "power"])
+            f_wm = ex.submit(adb, ["dumpsys", "window", "policy"])
+            f_display = ex.submit(adb, ["dumpsys", "display"])
+            f_power = ex.submit(adb, ["dumpsys", "power"])
 
-        bat = f_bat.result(); batt_sys = f_batt_sys.result(); zones = f_thermal.result()
-        mem_raw = f_meminfo.result(); df_raw = f_df.result(); stat_raw = f_stat.result()
-        cpuinfo = f_cpuinfo.result(); freq_raw = f_freq.result(); fg_raw = f_fg.result()
-        proc_raw = _ps_cache["proc_raw"] if (MODE == "monitor" and proc_cached) else f_ps.result()
-        wm_raw = f_wm.result(); display_raw = f_display.result()
-        wl_raw = f_power.result()
-
-        # 更新 ps 缓存
-        if MODE == "monitor" and not proc_cached:
-            _ps_cache["proc_raw"] = proc_raw
-            _ps_cache["ts"] = time.time()
+            bat = f_bat.result(); batt_sys = f_batt_sys.result(); zones = f_thermal.result()
+            mem_raw = f_meminfo.result(); df_raw = f_df.result(); stat_raw = f_stat.result()
+            cpuinfo = f_cpuinfo.result(); freq_raw = f_freq.result(); fg_raw = f_fg.result()
+            proc_raw = f_ps.result()
+            wm_raw = f_wm.result(); display_raw = f_display.result()
+            wl_raw = f_power.result()
 
     for line in bat.split("\n"):
         line = line.strip()
