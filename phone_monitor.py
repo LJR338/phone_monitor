@@ -861,6 +861,228 @@ def get_net_traffic():
     return apps[:20]
 
 
+# ======================= v6.5 - 测试增强功能 =======================
+
+# 磁盘IO跟踪（用于增量计算）
+_prev_diskstats = {}
+_diskstats_lock = threading.Lock()
+
+def get_fps_framestats(pkg):
+    """FPS实时监控 - dumpsys gfxinfo framestats"""
+    raw = adb(["dumpsys","gfxinfo",pkg,"framestats"])
+    result = {"pkg":pkg,"total_frames":0,"recent_fps":0,"avg_frame_ms":0,
+              "jank_pct":0,"vsync_miss":0,"frame_times":[]}
+    if not raw: return result
+    lines = raw.strip().split("\n")
+    # framestats 格式: 128列/帧，关键列: INTENDED_VSYNC(1), VSYNC(2), FRAME_COMPLETED(13)
+    # 跳过 header 行 (以 "---PROFILEDATA---" 或 "Flags," 开头)
+    frames = []
+    for line in lines:
+        if "---PROFILEDATA---" in line or "Flags," in line or "---" in line:
+            continue
+        parts = line.strip().split(",")
+        if len(parts) >= 14:
+            try:
+                intended = int(parts[1]); vsync = int(parts[2]); completed = int(parts[13])
+                if intended > 0 and completed > 0 and completed > intended:
+                    frame_ms = (completed - intended) / 1000000
+                    frames.append({"ms":round(frame_ms,1),"vsync_delta":(vsync-intended)//1000000 if vsync>intended else 0})
+            except: pass
+    if not frames: return result
+    # 取最近 120 帧
+    recent = frames[-120:]
+    result["total_frames"] = len(frames)
+    result["frame_times"] = [f["ms"] for f in recent]
+    # 计算平均帧耗时和等价 FPS
+    avg_ms = sum(result["frame_times"]) / len(result["frame_times"])
+    result["avg_frame_ms"] = round(avg_ms, 1)
+    result["recent_fps"] = round(1000 / avg_ms, 1) if avg_ms > 0 else 0
+    # Jank: 帧耗时超过 16.67ms (60fps 基准) 视为 Jank
+    jank_count = sum(1 for t in result["frame_times"] if t > 16.67)
+    result["jank_pct"] = round(jank_count / len(recent) * 100, 1)
+    result["vsync_miss"] = sum(1 for f in recent if f.get("vsync_delta",0) > 1)
+    return result
+
+
+def get_meminfo_detail(pkg):
+    """进程详细内存分解 - dumpsys meminfo"""
+    raw = adb(["dumpsys","meminfo",pkg])
+    if not raw or "No process found" in raw:
+        return {"pkg":pkg,"error":"进程未运行或包名错误","pid":0}
+    result = {"pkg":pkg,"pid":0,"categories":[],"summary":{}}
+    # 解析 PSS Total
+    m = re.search(r'TOTAL\s+PSS:\s*(\d+)', raw)
+    if m: result["summary"]["total_pss_kb"] = int(m.group(1))
+    m = re.search(r'TOTAL SWAP PSS:\s*(\d+)', raw)
+    if m: result["summary"]["swap_pss_kb"] = int(m.group(1))
+    # 解析分类: Native Heap / Dalvik Heap / Stack / Graphics / Code / Other 等
+    # 格式:   Native Heap    12345    10000    ...
+    cat_order = ["Native Heap","Dalvik Heap","Dalvik Other","Stack","Ashmem","Gfx dev",
+                 "Other dev",".so mmap",".jar mmap",".apk mmap",".ttf mmap",".dex mmap",
+                 ".oat mmap",".art mmap","Other mmap","EGL mtrack","Graphics","GL mtrack",
+                 "Unknown"]
+    for cat in cat_order:
+        # 匹配行: "  Native Heap                12345      10000"
+        mp = re.search(r'\s{2}' + re.escape(cat) + r'\s+(\d+)\s+(\d+)\s+(\d+)', raw)
+        if mp:
+            result["categories"].append({
+                "name":cat,"pss":int(mp.group(1)),"private_dirty":int(mp.group(2)),
+                "swapped":int(mp.group(3))
+            })
+    # 解析 PID
+    mp = re.search(r'\*\* MEMINFO in pid (\d+)', raw)
+    if mp: result["pid"] = int(mp.group(1))
+    return result
+
+
+def check_anr():
+    """检测 /data/anr/ 目录中的 ANR/trace 文件"""
+    raw = adb(["ls","-l","/data/anr/"])
+    result = {"files":[],"count":0,"errors":0}
+    if not raw or "No such file" in raw or "Permission denied" in raw:
+        result["error"] = "无法访问 /data/anr/（需 root 或可调试应用）"
+        return result
+    for line in raw.split("\n"):
+        line = line.strip()
+        if not line or line.startswith("total"): continue
+        parts = line.split()
+        if len(parts) >= 8:
+            fname = parts[-1]
+            fsize = parts[4] if len(parts) >= 5 else "?"
+            result["files"].append({"name":fname,"size":fsize,"time":" ".join(parts[5:8])})
+            # 统计 traces.txt 大小（通常包含崩溃堆栈）
+            if fname == "traces.txt":
+                try: result["errors"] = int(fsize) if fsize.isdigit() else (fsize != "0")
+                except: pass
+    result["count"] = len(result["files"])
+    return result
+
+
+def get_io_stats():
+    """IO磁盘性能 - /proc/diskstats 增量"""
+    global _prev_diskstats
+    raw = adb(["cat","/proc/diskstats"])
+    if not raw: return {}
+    result = {"devices":[],"total_read_mb":0,"total_write_mb":0,"read_mbps":0,"write_mbps":0}
+    now = {}
+    for line in raw.split("\n"):
+        parts = line.split()
+        if len(parts) < 14: continue
+        # fields: major minor name reads rmerge rsectors rtime writes wmerge wsectors wtime io_progress iotime wtime2
+        dev = parts[2]
+        # 只统计物理块设备 (mmcblk/sda/sdb 等)
+        if not any(dev.startswith(p) for p in ["mmcblk","sd","nvme","dm-","loop"]): continue
+        try:
+            rsectors = int(parts[5]); wsectors = int(parts[9])
+            now[dev] = {"rsectors":rsectors,"wsectors":wsectors}
+        except: pass
+    with _diskstats_lock:
+        if _prev_diskstats:
+            for dev, nv in now.items():
+                pv = _prev_diskstats.get(dev)
+                if pv:
+                    dr = max(0, nv["rsectors"] - pv["rsectors"]) * 512
+                    dw = max(0, nv["wsectors"] - pv["wsectors"]) * 512
+                    result["devices"].append({"dev":dev,"read_mb":round(dr/1048576,2),"write_mb":round(dw/1048576,2)})
+            # 汇总
+            result["total_read_mb"] = round(sum(d["read_mb"] for d in result["devices"]),2)
+            result["total_write_mb"] = round(sum(d["write_mb"] for d in result["devices"]),2)
+        _prev_diskstats = now
+    return result
+
+
+def get_doze_state():
+    """Doze/待机状态探测"""
+    # dumpsys deviceidle
+    idle_raw = adb(["dumpsys","deviceidle"])
+    result = {"idle_mode":False,"light_idle":False,"deep_idle":False,
+              "force_idle":False,"charging":False,"screen_on":True}
+    for line in idle_raw.split("\n"):
+        line = line.strip()
+        if line.startswith("mState="): result["raw_state"] = line.split("=",1)[1]
+        elif line.startswith("mLightState="): result["light_idle"] = "ACTIVE" in line
+        elif line.startswith("mDeepEnabled="): result["deep_idle"] = "true" in line.lower()
+        elif line.startswith("mForceIdle="): result["force_idle"] = "true" in line.lower()
+        elif line.startswith("mCharging="): result["charging"] = "true" in line.lower()
+        elif line.startswith("mScreenOn="): result["screen_on"] = "true" in line.lower()
+    # 检查是否处于 idle 模式
+    if "mState=" in idle_raw:
+        result["idle_mode"] = "IDLE" in result.get("raw_state","")
+    # dumpsys usagestats 最近待机时间
+    usage_raw = adb(["dumpsys","usagestats"])
+    m = re.search(r'Last idle time:.*?(\d+)ms', usage_raw)
+    if m: result["last_idle_ms"] = int(m.group(1))
+    return result
+
+
+def get_cpu_governor():
+    """CPU调度详情 - 每核心 governor 和当前频率"""
+    result = {"cores":[],"total_cores":0}
+    # 读取所有核心
+    raw = adb(["ls","/sys/devices/system/cpu/"])
+    core_ids = re.findall(r'cpu(\d+)', raw)
+    core_ids = sorted(set(int(c) for c in core_ids))
+    result["total_cores"] = len(core_ids)
+    for cid in core_ids:
+        core_info = {"id":cid}
+        # governor
+        gov = adb(["cat",f"/sys/devices/system/cpu/cpu{cid}/cpufreq/scaling_governor"])
+        core_info["governor"] = gov.strip() if gov else "?"
+        # current freq
+        freq = adb(["cat",f"/sys/devices/system/cpu/cpu{cid}/cpufreq/scaling_cur_freq"])
+        try: core_info["freq_mhz"] = round(int(freq.strip())/1000,1)
+        except: core_info["freq_mhz"] = 0
+        # min/max freq
+        min_f = adb(["cat",f"/sys/devices/system/cpu/cpu{cid}/cpufreq/scaling_min_freq"])
+        try: core_info["min_mhz"] = round(int(min_f.strip())/1000,1)
+        except: core_info["min_mhz"] = 0
+        max_f = adb(["cat",f"/sys/devices/system/cpu/cpu{cid}/cpufreq/scaling_max_freq"])
+        try: core_info["max_mhz"] = round(int(max_f.strip())/1000,1)
+        except: core_info["max_mhz"] = 0
+        result["cores"].append(core_info)
+    return result
+
+
+def get_gpu_info():
+    """GPU频率和负载 - sysfs kgsl"""
+    result = {"gpu_model":"","gpu_freq_mhz":0,"gpu_busy_pct":0,"gpu_available":False}
+    # Adreno GPU (高通)
+    gpuclk = adb(["cat","/sys/class/kgsl/kgsl-3d0/gpuclk"])
+    if gpuclk:
+        result["gpu_available"] = True
+        try: result["gpu_freq_mhz"] = round(int(gpuclk.strip())/1000000,1)
+        except: pass
+    gpubusy = adb(["cat","/sys/class/kgsl/kgsl-3d0/gpubusy"])
+    if gpubusy:
+        parts = gpubusy.strip().split()
+        if len(parts) == 2:
+            try:
+                busy = int(parts[0]); total = int(parts[1])
+                result["gpu_busy_pct"] = round(busy/max(total,1)*100,1) if total>0 else 0
+            except: pass
+    # Mali GPU (联发科/三星)
+    if not result["gpu_available"]:
+        malifreq = adb(["cat","/sys/class/misc/mali0/device/devfreq/13000000.mali/cur_freq"])
+        if malifreq:
+            result["gpu_available"] = True
+            try: result["gpu_freq_mhz"] = round(int(malifreq.strip())/1000000,1)
+            except: pass
+        maliutil = adb(["cat","/sys/class/misc/mali0/device/devfreq/13000000.mali/load"])
+        if maliutil:
+            try: result["gpu_busy_pct"] = int(maliutil.strip())
+            except: pass
+    # GPU型号
+    raw = adb(["cat","/proc/gpufreq/gpufreq_opp_dump"])
+    if not raw:
+        raw = adb(["dumpsys","SurfaceFlinger"])
+        m = re.search(r'GLES:\s*(\S+)', raw)
+        if m: result["gpu_model"] = m.group(1)
+    return result
+
+
+# ======================= v6.5 结束 =======================
+
+
 def start_logcat_stream(pkg):
     """启动 logcat 流"""
     pid = ""
@@ -1102,6 +1324,14 @@ input[type="number"] { width: 70px; }
 <button class="tab app" onclick="switchTab('traffic')">流量</button>
 <button class="tab app" onclick="switchTab('monkey')">Monkey</button>
 <button class="tab app" onclick="switchTab('screenshot')">截图对比</button>
+<span class="tab-sep"></span>
+<button class="tab app" onclick="switchTab('fps')">FPS实时</button>
+<button class="tab app" onclick="switchTab('meminfo')">内存分解</button>
+<button class="tab app" onclick="switchTab('anr')">ANR检测</button>
+<button class="tab app" onclick="switchTab('iostat')">IO性能</button>
+<button class="tab app" onclick="switchTab('doze')">Doze检测</button>
+<button class="tab app" onclick="switchTab('cpugov')">CPU调度</button>
+<button class="tab app" onclick="switchTab('gpuinfo')">GPU频率</button>
 </div>
 
 <!-- 仪表盘 -->
@@ -1180,6 +1410,76 @@ input[type="number"] { width: 70px; }
 <div class="col"><div class="card-title" style="margin-bottom:4px">截图 B</div><div id="shotB" style="color:#484f58;font-size:10px">未截取</div></div>
 </div>
 <div style="margin-top:8px"><div class="card-title" style="margin-bottom:4px">差异图（红色=差异区域）</div><canvas id="diffCanvas" style="max-width:100%;display:none"></canvas><div id="diffInfo" style="font-size:10px;color:#8b949e"></div></div>
+</div>
+</div>
+
+<!-- v6.5 测试增强 -->
+<div id="tab-fps" class="tab-content">
+<div class="card"><div class="card-title">FPS 实时监控 (dumpsys gfxinfo framestats)</div>
+<div class="form-row">
+<input type="text" id="fpsPkg" placeholder="包名" value="com.tencent.mm">
+<button class="btn add-btn" onclick="queryFps()">查询帧率</button>
+<span style="font-size:8px;color:#8b949e">先操作 App 几秒再查询</span>
+</div>
+<div id="fpsResult"></div>
+</div>
+</div>
+
+<div id="tab-meminfo" class="tab-content">
+<div class="card"><div class="card-title">进程内存详细分解 (dumpsys meminfo)</div>
+<div class="form-row">
+<input type="text" id="meminfoPkg" placeholder="包名" value="com.tencent.mm">
+<button class="btn add-btn" onclick="queryMeminfo()">查询</button>
+</div>
+<div id="meminfoResult"></div>
+</div>
+</div>
+
+<div id="tab-anr" class="tab-content">
+<div class="card"><div class="card-title">ANR / Crash 检测 (/data/anr/)</div>
+<div class="form-row">
+<button class="btn add-btn" onclick="queryAnr()">检测ANR</button>
+<span style="font-size:8px;color:#8b949e">检测 traces.txt 大小变化</span>
+</div>
+<div id="anrResult"></div>
+</div>
+</div>
+
+<div id="tab-iostat" class="tab-content">
+<div class="card"><div class="card-title">IO 磁盘性能 (/proc/diskstats)</div>
+<div class="form-row">
+<button class="btn add-btn" onclick="queryIoStat()">查询IO</button>
+<button class="btn" onclick="resetIoStat()">重置基准</button>
+<span style="font-size:8px;color:#8b949e">首次查询建立基准，再次查询显示增量</span>
+</div>
+<div id="iostatResult"></div>
+</div>
+</div>
+
+<div id="tab-doze" class="tab-content">
+<div class="card"><div class="card-title">Doze / 待机状态探测 (dumpsys deviceidle)</div>
+<div class="form-row">
+<button class="btn add-btn" onclick="queryDoze()">检测Doze</button>
+</div>
+<div id="dozeResult"></div>
+</div>
+</div>
+
+<div id="tab-cpugov" class="tab-content">
+<div class="card"><div class="card-title">CPU 调度详情 (/sys/devices/system/cpu/)</div>
+<div class="form-row">
+<button class="btn add-btn" onclick="queryCpuGov()">查询CPU调度</button>
+</div>
+<div id="cpugovResult"></div>
+</div>
+</div>
+
+<div id="tab-gpuinfo" class="tab-content">
+<div class="card"><div class="card-title">GPU 频率与负载 (sysfs kgsl / mali)</div>
+<div class="form-row">
+<button class="btn add-btn" onclick="queryGpuInfo()">查询GPU</button>
+</div>
+<div id="gpuinfoResult"></div>
 </div>
 </div>
 
@@ -1621,6 +1921,156 @@ function updateModeUI(mode){
 
 fetch('/mode/state').then(r=>r.json()).then(d=>updateModeUI(d.mode)).catch(()=>{});
 
+// ===== v6.5 测试增强 JS =====
+
+function queryFps() {
+    let pkg = document.getElementById('fpsPkg').value.trim();
+    if(!pkg) { showToast('请输入包名'); return; }
+    document.getElementById('fpsResult').innerHTML = '<span style="color:#8b949e">查询中...</span>';
+    fetch('/fps?pkg='+encodeURIComponent(pkg)).then(r=>r.json()).then(d=>{
+        if(d.error) { document.getElementById('fpsResult').innerHTML = '<span style="color:#F44336">'+d.error+'</span>'; return; }
+        let html='<div class="grid" style="margin-top:6px">';
+        html+='<div class="card"><div class="card-title">平均FPS</div><div class="big-num" style="color:'+(d.recent_fps>=55?'#4CAF50':d.recent_fps>=30?'#FF9800':'#F44336')+'">'+d.recent_fps+'<span class="unit">fps</span></div></div>';
+        html+='<div class="card"><div class="card-title">平均帧耗时</div><div class="big-num" style="color:'+(d.avg_frame_ms<=18?'#4CAF50':d.avg_frame_ms<=32?'#FF9800':'#F44336')+'">'+d.avg_frame_ms+'<span class="unit">ms</span></div></div>';
+        html+='<div class="card"><div class="card-title">Jank 比例</div><div class="big-num" style="color:'+(d.jank_pct<=10?'#4CAF50':d.jank_pct<=30?'#FF9800':'#F44336')+'">'+d.jank_pct+'<span class="unit">%</span></div></div>';
+        html+='<div class="card"><div class="card-title">Vsync丢失</div><div class="big-num">'+d.vsync_miss+'<span class="unit">次</span></div></div>';
+        html+='<div class="card"><div class="card-title">统计帧数</div><div class="big-num">'+d.total_frames+'<span class="unit">帧</span></div></div>';
+        html+='</div>';
+        // 帧耗时分布直方图
+        if(d.frame_times && d.frame_times.length>0){
+            let maxT = Math.max(...d.frame_times,50);
+            html+='<div class="card"><div class="card-title">帧耗时分布 (最近'+d.frame_times.length+'帧)</div>';
+            html+='<div style="display:flex;align-items:flex-end;height:60px;gap:1px;margin-top:8px">';
+            d.frame_times.forEach(t=>{
+                let h=Math.max(2,(t/maxT)*60);let c=t<=16.67?'#4CAF50':t<=33?'#FF9800':'#F44336';
+                html+='<div style="flex:1;background:'+c+';height:'+h+'px;min-width:2px" title="'+t+'ms"></div>';
+            });
+            html+='<div style="font-size:7px;color:#8b949e;position:absolute;bottom:-12px">0ms</div><div style="font-size:7px;color:#8b949e;position:absolute;bottom:-12px;right:8px">'+maxT+'ms</div></div>';
+            html+='</div>';
+        }
+        document.getElementById('fpsResult').innerHTML = html;
+    }).catch(()=>{document.getElementById('fpsResult').innerHTML='<span style="color:#F44336">ADB连接失败</span>';});
+}
+
+function queryMeminfo() {
+    let pkg = document.getElementById('meminfoPkg').value.trim();
+    if(!pkg) { showToast('请输入包名'); return; }
+    document.getElementById('meminfoResult').innerHTML = '<span style="color:#8b949e">查询中...</span>';
+    fetch('/meminfo?pkg='+encodeURIComponent(pkg)).then(r=>r.json()).then(d=>{
+        if(d.error) { document.getElementById('meminfoResult').innerHTML = '<span style="color:#F44336">'+d.error+'</span>'; return; }
+        let html='';
+        if(d.summary && d.summary.total_pss_kb){
+            let pssMB = (d.summary.total_pss_kb/1024).toFixed(1);
+            html+='<div class="grid" style="margin-top:6px">';
+            html+='<div class="card"><div class="card-title">PID</div><div class="big-num">'+d.pid+'</div></div>';
+            html+='<div class="card"><div class="card-title">TOTAL PSS</div><div class="big-num" style="color:'+(pssMB<300?'#4CAF50':pssMB<600?'#FF9800':'#F44336')+'">'+pssMB+'<span class="unit">MB</span></div></div>';
+            if(d.summary.swap_pss_kb) html+='<div class="card"><div class="card-title">Swap</div><div class="big-num">'+(d.summary.swap_pss_kb/1024).toFixed(1)+'<span class="unit">MB</span></div></div>';
+            html+='</div>';
+        }
+        if(d.categories && d.categories.length>0){
+            html+='<div class="table-card"><table style="width:100%;border-collapse:collapse">';
+            html+='<tr><th>分类</th><th style="text-align:right">PSS (KB)</th><th style="text-align:right">Private Dirty</th><th style="text-align:right">Swapped</th></tr>';
+            let maxPSS = Math.max(...d.categories.map(c=>c.pss),1);
+            d.categories.forEach(c=>{
+                let barW = (c.pss/maxPSS*100).toFixed(0);
+                html+='<tr><td>'+c.name+'<div class="bar-bg"><div class="bar-fill" style="width:'+barW+'%;background:'+(c.pss>50000?'#F44336':c.pss>10000?'#FF9800':'#58a6ff')+'"></div></div></td><td style="text-align:right">'+c.pss.toLocaleString()+'</td><td style="text-align:right">'+c.private_dirty.toLocaleString()+'</td><td style="text-align:right">'+c.swapped.toLocaleString()+'</td></tr>';
+            });
+            html+='</table></div>';
+        }
+        document.getElementById('meminfoResult').innerHTML = html;
+    }).catch(()=>{document.getElementById('meminfoResult').innerHTML='<span style="color:#F44336">ADB连接失败</span>';});
+}
+
+function queryAnr() {
+    document.getElementById('anrResult').innerHTML = '<span style="color:#8b949e">检测中...</span>';
+    fetch('/anr').then(r=>r.json()).then(d=>{
+        if(d.error) { document.getElementById('anrResult').innerHTML = '<span style="color:#F44336">'+d.error+'</span>'; return; }
+        let html='<div class="grid" style="margin-top:6px">';
+        html+='<div class="card"><div class="card-title">文件数量</div><div class="big-num" style="color:'+(d.count>2?'#F44336':d.count>0?'#FF9800':'#4CAF50')+'">'+d.count+'</div></div>';
+        html+='<div class="card"><div class="card-title">ANR风险</div><div class="big-num" style="color:'+(d.errors>0?'#F44336':'#4CAF50')+'">'+(d.errors>0?'⚠ 已检测到':'✓ 无异常')+'</div></div>';
+        html+='</div>';
+        if(d.files && d.files.length>0){
+            html+='<div class="table-card"><table style="width:100%"><tr><th>文件名</th><th>大小</th><th>时间</th></tr>';
+            d.files.forEach(f=>{
+                html+='<tr><td style="color:'+(f.name==='traces.txt'&&d.errors?'#F44336':'#c9d1d9')+'">'+f.name+'</td><td>'+f.size+'</td><td>'+f.time+'</td></tr>';
+            });
+            html+='</table></div>';
+        }
+        document.getElementById('anrResult').innerHTML = html;
+    }).catch(()=>{document.getElementById('anrResult').innerHTML='<span style="color:#F44336">ADB连接失败</span>';});
+}
+
+function queryIoStat() {
+    document.getElementById('iostatResult').innerHTML = '<span style="color:#8b949e">查询中...</span>';
+    fetch('/iostat').then(r=>r.json()).then(d=>{
+        if(!d || !d.devices){
+            document.getElementById('iostatResult').innerHTML='<span style="color:#8b949e">已建立基准，再次点击查看IO增量</span>';
+            return;
+        }
+        let html='<div class="grid" style="margin-top:6px">';
+        html+='<div class="card"><div class="card-title">总读取</div><div class="big-num">'+d.total_read_mb+'<span class="unit">MB</span></div></div>';
+        html+='<div class="card"><div class="card-title">总写入</div><div class="big-num">'+d.total_write_mb+'<span class="unit">MB</span></div></div>';
+        html+='</div>';
+        if(d.devices && d.devices.length>0){
+            html+='<div class="table-card"><table style="width:100%"><tr><th>设备</th><th style="text-align:right">读取</th><th style="text-align:right">写入</th></tr>';
+            d.devices.forEach(dev=>{
+                html+='<tr><td>'+dev.dev+'</td><td style="text-align:right">'+dev.read_mb+' MB</td><td style="text-align:right">'+dev.write_mb+' MB</td></tr>';
+            });
+            html+='</table></div>';
+        }
+        document.getElementById('iostatResult').innerHTML = html;
+    }).catch(()=>{document.getElementById('iostatResult').innerHTML='<span style="color:#F44336">ADB连接失败</span>';});
+}
+
+function resetIoStat() { document.getElementById('iostatResult').innerHTML='<span style="color:#8b949e">基准已重置，再次点击"查询IO"建立新基准</span>'; fetch('/iostat').catch(()=>{}); }
+
+function queryDoze() {
+    document.getElementById('dozeResult').innerHTML = '<span style="color:#8b949e">检测中...</span>';
+    fetch('/doze').then(r=>r.json()).then(d=>{
+        let html='<div class="grid" style="margin-top:6px">';
+        html+='<div class="card"><div class="card-title">Doze状态</div><div class="big-num" style="color:'+(d.idle_mode?'#FF9800':'#4CAF50')+'">'+(d.idle_mode?'已进入Doze':'正常模式')+'</div></div>';
+        html+='<div class="card"><div class="card-title">Light Idle</div><div class="big-num" style="color:'+(d.light_idle?'#FF9800':'#4CAF50')+'">'+(d.light_idle?'ON':'OFF')+'</div></div>';
+        html+='<div class="card"><div class="card-title">Deep Idle</div><div class="big-num" style="color:'+(d.deep_idle?'#FF9800':'#4CAF50')+'">'+(d.deep_idle?'启用':'未启用')+'</div></div>';
+        html+='<div class="card"><div class="card-title">强制Idle</div><div class="big-num" style="color:'+(d.force_idle?'#F44336':'#4CAF50')+'">'+(d.force_idle?'ON':'OFF')+'</div></div>';
+        html+='<div class="card"><div class="card-title">充电中</div><div class="big-num">'+(d.charging?'是':'否')+'</div></div>';
+        html+='<div class="card"><div class="card-title">屏幕</div><div class="big-num">'+(d.screen_on?'亮屏':'息屏')+'</div></div>';
+        if(d.raw_state) html+='<div class="card"><div class="card-title">原始状态</div><div class="num-sm">'+d.raw_state+'</div></div>';
+        if(d.last_idle_ms) html+='<div class="card"><div class="card-title">距上次Idle</div><div class="num-sm">'+(d.last_idle_ms/1000).toFixed(0)+'<span class="unit">s</span></div></div>';
+        html+='</div>';
+        document.getElementById('dozeResult').innerHTML = html;
+    }).catch(()=>{document.getElementById('dozeResult').innerHTML='<span style="color:#F44336">ADB连接失败</span>';});
+}
+
+function queryCpuGov() {
+    document.getElementById('cpugovResult').innerHTML = '<span style="color:#8b949e">查询中...</span>';
+    fetch('/cpugov').then(r=>r.json()).then(d=>{
+        let html='<div class="grid" style="margin-top:6px"><div class="card"><div class="card-title">核心数</div><div class="big-num">'+d.total_cores+'</div></div></div>';
+        if(d.cores && d.cores.length>0){
+            html+='<div class="table-card"><table style="width:100%"><tr><th>核心</th><th style="text-align:center">Governor</th><th style="text-align:right">当前频率</th><th style="text-align:right">最小</th><th style="text-align:right">最大</th></tr>';
+            d.cores.forEach(c=>{
+                let pct = c.max_mhz>0?((c.freq_mhz/c.max_mhz)*100).toFixed(0):0;
+                let clr = pct>80?'#F44336':pct>40?'#FF9800':'#4CAF50';
+                html+='<tr><td>CPU'+c.id+'</td><td style="text-align:center;font-size:9px">'+c.governor+'</td><td style="text-align:right;color:'+clr+';font-weight:bold">'+c.freq_mhz+'<span style="font-size:8px;color:#8b949e"> MHz</span></td><td style="text-align:right">'+c.min_mhz+'</td><td style="text-align:right">'+c.max_mhz+'</td></tr>';
+            });
+            html+='</table></div>';
+        }
+        document.getElementById('cpugovResult').innerHTML = html;
+    }).catch(()=>{document.getElementById('cpugovResult').innerHTML='<span style="color:#F44336">ADB连接失败</span>';});
+}
+
+function queryGpuInfo() {
+    document.getElementById('gpuinfoResult').innerHTML = '<span style="color:#8b949e">查询中...</span>';
+    fetch('/gpuinfo').then(r=>r.json()).then(d=>{
+        if(!d.gpu_available){ document.getElementById('gpuinfoResult').innerHTML='<span style="color:#8b949e">GPU 信息不可用（非高通/ARM Mali GPU 或不支持 sysfs）</span>'; return; }
+        let html='<div class="grid" style="margin-top:6px">';
+        html+='<div class="card"><div class="card-title">GPU频率</div><div class="big-num" style="color:'+(d.gpu_freq_mhz>500?'#FF9800':'#4CAF50')+'">'+d.gpu_freq_mhz+'<span class="unit">MHz</span></div></div>';
+        html+='<div class="card"><div class="card-title">GPU负载</div><div class="big-num" style="color:'+(d.gpu_busy_pct>50?'#F44336':d.gpu_busy_pct>20?'#FF9800':'#4CAF50')+'">'+d.gpu_busy_pct+'<span class="unit">%</span></div></div>';
+        if(d.gpu_model) html+='<div class="card"><div class="card-title">GPU型号</div><div class="num-sm">'+d.gpu_model+'</div></div>';
+        html+='</div>';
+        document.getElementById('gpuinfoResult').innerHTML = html;
+    }).catch(()=>{document.getElementById('gpuinfoResult').innerHTML='<span style="color:#F44336">ADB连接失败</span>';});
+}
+
 // ===== 主循环 =====
 let currentMode = 'monitor';
 let failCount=0;
@@ -1752,6 +2202,29 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
         elif parsed.path == "/traffic":
             self._json(get_net_traffic())
+
+        elif parsed.path == "/fps":
+            pkg = qs.get("pkg",[""])[0]
+            self._json(get_fps_framestats(pkg) if pkg else {"error":"请提供包名"})
+
+        elif parsed.path == "/meminfo":
+            pkg = qs.get("pkg",[""])[0]
+            self._json(get_meminfo_detail(pkg) if pkg else {"error":"请提供包名"})
+
+        elif parsed.path == "/anr":
+            self._json(check_anr())
+
+        elif parsed.path == "/iostat":
+            self._json(get_io_stats())
+
+        elif parsed.path == "/doze":
+            self._json(get_doze_state())
+
+        elif parsed.path == "/cpugov":
+            self._json(get_cpu_governor())
+
+        elif parsed.path == "/gpuinfo":
+            self._json(get_gpu_info())
 
         elif parsed.path == "/monkey/history":
             with monkey_results_lock: self._json(list(monkey_results))
