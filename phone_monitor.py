@@ -1087,15 +1087,15 @@ function renderDash(d) {
     });
     let [procRows, memProcRows] = buildProcRows(d.top_procs, d.top_mem_procs);
     let html='<div class="grid">';
-    html+='<div class="card"><div class="card-title">温度</div><div class="big-num" style="color:'+tc(d.temp)+'">'+(d.temp||0).toFixed(1)+'<span class="unit">°C</span></div></div>';
-    html+='<div class="card"><div class="card-title">SoC</div><div class="big-num" style="color:'+tc(d.soc_max)+'">'+(d.soc_max||0).toFixed(1)+'<span class="unit">°C</span></div></div>';
-    html+='<div class="card"><div class="card-title">电量</div><div class="big-num" style="color:'+batClr+'">'+batPct+'<span class="unit">%</span></div></div>';
-    html+='<div class="card"><div class="card-title">充/放电</div><div class="num-sm" style="color:'+chgClr+'">'+chgArrow+' '+(d.charge_current||0)+'<span class="unit">mA</span></div><div class="label">'+(d.charge_power||0)+'W</div></div>';
-    html+='<div class="card"><div class="card-title">内存</div><div class="big-num" style="color:'+pc(d.mem_used_pct)+'">'+(d.mem_used_pct||0).toFixed(1)+'<span class="unit">%</span></div></div>';
-    html+='<div class="card"><div class="card-title">CPU空闲</div><div class="num-sm">'+(d.cpu_idle_pct||0).toFixed(0)+'<span class="unit">%</span></div></div>';
-    html+='<div class="card"><div class="card-title">前台</div><div class="num-sm" style="font-size:10px">'+(d.fg_app||"")+'</div></div>';
-    html+='<div class="card"><div class="card-title">屏幕</div><div style="font-size:10px">'+(d.screen_on?'<span style="color:#58a6ff">亮屏</span>':'<span style="color:#484f58">息屏</span>')+'</div></div>';
-    html+='<div class="card"><div class="card-title">时间</div><div class="num-sm" style="color:#58a6ff">'+d.time+'</div></div>';
+    html+='<div class="card"><div class="card-title">温度</div><div class="big-num" style="color:'+tc(d.temp)+'" id="val-temp">'+(d.temp||0).toFixed(1)+'<span class="unit">°C</span></div></div>';
+    html+='<div class="card"><div class="card-title">SoC</div><div class="big-num" style="color:'+tc(d.soc_max)+'" id="val-soc">'+(d.soc_max||0).toFixed(1)+'<span class="unit">°C</span></div></div>';
+    html+='<div class="card"><div class="card-title">电量</div><div class="big-num" style="color:'+batClr+'" id="val-bat">'+batPct+'<span class="unit">%</span></div></div>';
+    html+='<div class="card"><div class="card-title">充/放电</div><div class="num-sm" style="color:'+chgClr+'" id="val-charge">'+chgArrow+' '+(d.charge_current||0)+'<span class="unit">mA</span></div><div class="label" id="val-power">'+(d.charge_power||0)+'W</div></div>';
+    html+='<div class="card"><div class="card-title">内存</div><div class="big-num" style="color:'+pc(d.mem_used_pct)+'" id="val-mem">'+(d.mem_used_pct||0).toFixed(1)+'<span class="unit">%</span></div></div>';
+    html+='<div class="card"><div class="card-title">CPU空闲</div><div class="num-sm" id="val-cpu">'+(d.cpu_idle_pct||0).toFixed(0)+'<span class="unit">%</span></div></div>';
+    html+='<div class="card"><div class="card-title">前台</div><div class="num-sm" id="val-fg" style="font-size:10px">'+(d.fg_app||"")+'</div></div>';
+    html+='<div class="card"><div class="card-title">屏幕</div><div id="val-screen" style="font-size:10px">'+(d.screen_on?'<span style="color:#58a6ff">亮屏</span>':'<span style="color:#484f58">息屏</span>')+'</div></div>';
+    html+='<div class="card"><div class="card-title">时间</div><div class="num-sm" id="val-time" style="color:#58a6ff">'+d.time+'</div></div>';
     html+='</div>';
     html+='<div class="card" style="margin-bottom:8px"><div class="card-title">核心频率</div><div id="core-bars" style="line-height:18px">'+coreBars+'</div></div>';
     html+='<div class="chart-card"><div class="chart-title">历史趋势</div><div class="row"><div class="col"><canvas id="chart_temp"></canvas></div><div class="col"><canvas id="chart_discharge"></canvas></div></div></div>';
@@ -1106,10 +1106,21 @@ function renderDash(d) {
 }
 
 function patchDash(d) {
-    const batPct = d.bat_level||0;
-    const batClr = batPct>50?"#4CAF50":batPct>20?"#FF9800":"#F44336";
-    const chgClr = d.charging?"#4CAF50":"#484f58";
-    const chgArrow = d.charging?"↑":(d.charge_status=="放电中"?"↓":"");
+    let batPct = d.bat_level||0;
+    let batClr = batPct>50?"#4CAF50":batPct>20?"#FF9800":"#F44336";
+    let chgClr = d.charging?"#4CAF50":"#484f58";
+    let chgArrow = d.charging?"↑":(d.charge_status=="放电中"?"↓":"");
+    // 卡片值
+    let vt=document.getElementById("val-temp"); if(vt){vt.style.color=tc(d.temp);vt.innerHTML=(d.temp||0).toFixed(1)+'<span class="unit">°C</span>';}
+    let vs=document.getElementById("val-soc"); if(vs){vs.style.color=tc(d.soc_max);vs.innerHTML=(d.soc_max||0).toFixed(1)+'<span class="unit">°C</span>';}
+    let vb=document.getElementById("val-bat"); if(vb){vb.style.color=batClr;vb.innerHTML=batPct+'<span class="unit">%</span>';}
+    let vc=document.getElementById("val-charge"); if(vc){vc.style.color=chgClr;vc.innerHTML=chgArrow+' '+(d.charge_current||0)+'<span class="unit">mA</span>';}
+    let vp=document.getElementById("val-power"); if(vp)vp.innerHTML=(d.charge_power||0)+'W';
+    let vm=document.getElementById("val-mem"); if(vm){vm.style.color=pc(d.mem_used_pct);vm.innerHTML=(d.mem_used_pct||0).toFixed(1)+'<span class="unit">%</span>';}
+    let vcpu=document.getElementById("val-cpu"); if(vcpu)vcpu.innerHTML=(d.cpu_idle_pct||0).toFixed(0)+'<span class="unit">%</span>';
+    let vfg=document.getElementById("val-fg"); if(vfg)vfg.innerHTML=d.fg_app||"";
+    let vsc=document.getElementById("val-screen"); if(vsc)vsc.innerHTML=d.screen_on?'<span style="color:#58a6ff">亮屏</span>':'<span style="color:#484f58">息屏</span>';
+    let vti=document.getElementById("val-time"); if(vti)vti.innerHTML=d.time;
     // 核心频率
     let coreBars=""; (d.per_core_freqs||[]).forEach((f,i)=>{
         let pct=Math.min(f/3000*100,100),clr=f>2000?"#F44336":f>1000?"#FF9800":"#4CAF50";
