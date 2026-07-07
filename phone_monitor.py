@@ -638,22 +638,21 @@ def get_net_traffic():
 
 def start_logcat_stream(pkg):
     """启动 logcat 流"""
-    # 先获取 PID
     pid = ""
-    ps_raw = adb(["pidof", pkg])
-    if ps_raw:
-        pids = ps_raw.split()
-        if pids: pid = pids[0]
+    if pkg:
+        ps_raw = adb(["shell","pidof",pkg])
+        if ps_raw:
+            pids = ps_raw.strip().split()
+            if pids: pid = pids[0]
 
     stream_id = str(uuid.uuid4())[:8]
     q = queue.Queue()
     stop = threading.Event()
 
-    # 启动 adb logcat 进程
     if pid:
-        cmd = [ADB, "logcat", "-v", "brief", "--pid", pid]
+        cmd = [ADB, "shell", "logcat", "-v", "brief", "--pid=" + pid]
     else:
-        cmd = [ADB, "logcat", "-v", "brief"]
+        cmd = [ADB, "shell", "logcat", "-v", "brief"]
 
     try:
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
