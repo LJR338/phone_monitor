@@ -122,88 +122,215 @@ def get_data():
     data = {"time": time.strftime("%H:%M:%S"), "timestamp": time.time()}
 
     if MODE == "monitor":
-        # ===== 监控模式：V4 风格直接顺序调用 adb()，无 ThreadPoolExecutor =====
-        # 关键差异: 无 executor 提交/收集开销，每条命令间有自然 Python 语句间隙
-        # ps 使用带引号的单字符串格式，防止 shell 解释 %（V4 做法）
+        # ===== 监控模式：V5 风格 — 每条 ADB 调用后立即解析，形成自然间隔 =====
+
+        # 电池
         bat = adb(["dumpsys", "battery"])
-        batt_sys = adb(["cat", "/sys/class/power_supply/battery/voltage_now",
-            "/sys/class/power_supply/battery/current_now", "/sys/class/power_supply/battery/charge_type"])
+        for line in bat.split("\n"):
+            line = line.strip()
+            if "temperature:" in line:
+                try: data["temp"] = int(line.split(":")[1].strip()) / 10
+                except: data["temp"] = 0
+            elif "level:" in line:
+                try: data["bat_level"] = int(line.split(":")[1].strip())
+                except: data["bat_level"] = 0
+            elif "health:" in line:
+                try: data["bat_health"] = int(line.split(":")[1].strip())
+                except: data["bat_health"] = 1
+            elif "status:" in line:
+                try:
+                    s = int(line.split(":")[1].strip())
+                    data["charge_status"] = {2:"充电中",3:"放电中",4:"未充电",5:"已充满"}.get(s, "未知")
+                    data["charging"] = s == 2
+                except: data["charge_status"] = "?"
+
+        # 电压
+        volt_raw = adb(["cat", "/sys/class/power_supply/battery/voltage_now"])
+        try: data["bat_voltage"] = int(volt_raw) / 1000000
+        except: data["bat_voltage"] = 0
+
+        # 电流
+        curr = adb(["cat", "/sys/class/power_supply/battery/current_now"])
+        try: curr_val = int(curr); curr_ma = abs(curr_val) / 1000 if curr else 0
+        except: curr_ma = 0; curr_val = 0
+        data["charge_current"] = round(curr_ma, 0)
+        if data.get("bat_voltage", 0) > 0 and curr_ma > 0:
+            data["charge_power"] = round(curr_ma * data["bat_voltage"] / 1000, 1)
+        else: data["charge_power"] = 0
+        data["discharge_ma"] = round(curr_ma, 0) if not data.get("charging") and curr_ma > 0 else 0
+
+        # 充电类型
+        chtype = adb(["cat", "/sys/class/power_supply/battery/charge_type"])
+        data["charge_type"] = chtype if chtype else "?"
+
+        # SoC 温区
         zones = adb(["cat /sys/class/thermal/thermal_zone*/temp 2>/dev/null"])
+        temps = []
+        if zones:
+            for t in zones.split("\n"):
+                try: temps.append(int(t.strip()) / 1000)
+                except: pass
+        data["soc_max"] = round(max(temps), 1) if temps else 0
+
+        # 内存
         mem_raw = adb(["cat", "/proc/meminfo"])
+        mem = {}
+        for line in mem_raw.split("\n"):
+            parts = line.split(":")
+            if len(parts) == 2:
+                try: mem[parts[0].strip()] = int(parts[1].strip().split()[0])
+                except: pass
+        data["mem_total"] = round(mem.get("MemTotal", 0) / 1048576, 1)
+        data["mem_avail"] = round(mem.get("MemAvailable", 0) / 1048576, 1)
+        data["mem_used_pct"] = round((1 - mem.get("MemAvailable", 0) / max(mem.get("MemTotal", 1), 1)) * 100, 1)
+        swap_total = mem.get("SwapTotal", 0) / 1048576
+        swap_free = mem.get("SwapFree", 0) / 1048576
+        data["swap_pct"] = round((1 - swap_free / max(swap_total, 1)) * 100, 1) if swap_total > 0 else 0
+
+        # 存储
         df_raw = adb(["df", "-h", "/data"])
+        m = re.search(r'/data\s+(\d+\.?\d*[MG])\s+\d+\.?\d*[MG]\s+(\d+\.?\d*[MG])\s+(\d+)%', df_raw) if df_raw else None
+        if m: data["disk_total"], data["disk_free"], data["disk_pct"] = m.group(1), m.group(2), int(m.group(3))
+        else: data["disk_total"], data["disk_free"], data["disk_pct"] = "?", "?", 0
+
+        # /proc/stat
         stat_raw = adb(["cat", "/proc/stat"])
+        cpu_total_idle_pct = 0; per_core = []; now_stat = {}
+        if stat_raw:
+            for line in stat_raw.split("\n"):
+                fields = line.split()
+                if len(fields) >= 5 and fields[0].startswith("cpu"):
+                    vals = [int(x) for x in fields[1:8]]
+                    now_stat[fields[0]] = {"total": sum(vals), "idle": vals[3] + vals[4]}
+        with prev_stat_lock:
+            if prev_stat and now_stat:
+                for core, nv in now_stat.items():
+                    pv = prev_stat.get(core)
+                    if pv and nv["total"] > pv["total"]:
+                        dt, di = nv["total"] - pv["total"], nv["idle"] - pv["idle"]
+                        idle_pct = round(di / dt * 100, 1) if dt > 0 else 0
+                        if core == "cpu": cpu_total_idle_pct = idle_pct
+                        else: per_core.append({"core": core, "idle_pct": idle_pct})
+                per_core.sort(key=lambda x: int(x["core"].replace("cpu", "")) if x["core"].replace("cpu", "").isdigit() else 999)
+            prev_stat = now_stat
+        data["cpu_idle_pct"] = cpu_total_idle_pct
+        data["per_core"] = per_core
+
+        # CPU 频率
         cpuinfo = adb(["cat", "/proc/cpuinfo"])
+        data["cpu_cores"] = cpuinfo.count("processor\t:")
         freq_raw = adb(["cat /sys/devices/system/cpu/cpu*/cpufreq/scaling_cur_freq 2>/dev/null"])
+        freqs = []
+        if freq_raw:
+            for f in freq_raw.split("\n"):
+                try: freqs.append(int(f.strip()) / 1000)
+                except: pass
+        data["cpu_freq_avg"] = round(sum(freqs) / len(freqs), 0) if freqs else 0
+        data["per_core_freqs"] = freqs
+
+        # 前台应用
         fg_raw = adb(["dumpsys", "activity", "activities"])
-        # V5 风格：两次独立 ps 调用，分别按 CPU/MEM 排序并解析
+        fg_app = ""
+        for line in fg_raw.split("\n"):
+            if "mResumedActivity" in line or "mFocusedApp" in line:
+                parts = line.split()
+                for p in parts:
+                    if "/" in p and "." in p: fg_app = p.split("/")[0]; break
+                if fg_app: break
+        data["fg_app"] = fg_app[:50] if fg_app else "未知"
+
+        # CPU 进程 TOP15
         proc_raw = adb(["ps -A -o '%CPU,TCNT,ARGS' --sort=-%cpu"])
-        top_procs_d = {}
+        data["top_procs"] = []; seen_cpu = set()
         for line in proc_raw.split("\n")[1:]:
+            if len(data["top_procs"]) >= 15: break
             parts = line.strip().split(None, 2)
             if len(parts) >= 3:
                 try:
                     name = parts[2][:40]; pkg = parts[2].split(":")[0].split("/")[0].strip()[:50]
-                    if pkg not in top_procs_d:
-                        top_procs_d[pkg] = {"cpu": float(parts[0]), "tcnt": int(parts[1]), "name": name, "pkg": pkg}
+                    if pkg in seen_cpu: continue
+                    seen_cpu.add(pkg)
+                    data["top_procs"].append({"cpu": float(parts[0]), "tcnt": int(parts[1]), "name": name, "pkg": pkg})
                 except: pass
-        data["top_procs"] = sorted(top_procs_d.values(), key=lambda x: x["cpu"], reverse=True)[:15]
 
+        # 内存进程 TOP15
         mem_proc_raw = adb(["ps -A -o '%MEM,RSS,TCNT,ARGS' --sort=-%mem"])
-        top_mem_d = {}
+        data["top_mem_procs"] = []; seen_mem = set()
         for line in mem_proc_raw.split("\n")[1:]:
+            if len(data["top_mem_procs"]) >= 15: break
             parts = line.strip().split(None, 3)
             if len(parts) >= 4:
                 try:
                     name = parts[3][:40]; pkg = parts[3].split(":")[0].split("/")[0].strip()[:50]
-                    if pkg not in top_mem_d:
-                        top_mem_d[pkg] = {"mem_pct": float(parts[0]), "rss": round(int(parts[1])/1024,0), "tcnt": int(parts[2]), "name": name, "pkg": pkg}
+                    if pkg in seen_mem: continue
+                    seen_mem.add(pkg)
+                    data["top_mem_procs"].append({"mem_pct": float(parts[0]), "rss": round(int(parts[1])/1024,0), "tcnt": int(parts[2]), "name": name, "pkg": pkg})
                 except: pass
-        data["top_mem_procs"] = sorted(top_mem_d.values(), key=lambda x: x["mem_pct"], reverse=True)[:15]
 
+        # 屏幕
         wm_raw = adb(["dumpsys", "window", "policy"])
+        data["screen_on"] = "SCREEN_STATE_ON" in wm_raw
         display_raw = adb(["dumpsys", "display"])
+        for line in display_raw.split("\n"):
+            if "fps=" in line and "activeModeId" not in line:
+                for part in line.split(","):
+                    if "fps=" in part:
+                        try: data["fps"] = part.split("=")[1].strip()
+                        except: pass
+
+        # Wakelocks
         wl_raw = adb(["dumpsys", "power"])
-    else:
-        # ===== 测试模式：并行 ThreadPoolExecutor =====
-        with ThreadPoolExecutor(max_workers=8) as ex:
-            f_bat = ex.submit(adb, ["dumpsys", "battery"])
-            f_batt_sys = ex.submit(adb, ["cat", "/sys/class/power_supply/battery/voltage_now",
-                "/sys/class/power_supply/battery/current_now", "/sys/class/power_supply/battery/charge_type"])
-            f_thermal = ex.submit(adb, ["cat /sys/class/thermal/thermal_zone*/temp 2>/dev/null"])
-            f_meminfo = ex.submit(adb, ["cat", "/proc/meminfo"])
-            f_df = ex.submit(adb, ["df", "-h", "/data"])
-            f_stat = ex.submit(adb, ["cat", "/proc/stat"])
-            f_cpuinfo = ex.submit(adb, ["cat", "/proc/cpuinfo"])
-            f_freq = ex.submit(adb, ["cat /sys/devices/system/cpu/cpu*/cpufreq/scaling_cur_freq 2>/dev/null"])
-            f_fg = ex.submit(adb, ["dumpsys", "activity", "activities"])
-            f_ps = ex.submit(adb, ["ps", "-A", "-o", "%CPU,%MEM,RSS,TCNT,ARGS"])
-            f_wm = ex.submit(adb, ["dumpsys", "window", "policy"])
-            f_display = ex.submit(adb, ["dumpsys", "display"])
-            f_power = ex.submit(adb, ["dumpsys", "power"])
+        data["wakelocks"] = []; in_section = False
+        for line in wl_raw.split("\n"):
+            if "Wake Locks: size=" in line: in_section = True; continue
+            if in_section and "=" in line:
+                m2 = re.match(r'\s*Wake Lock (\S+)', line)
+                if m2: data["wakelocks"].append(m2.group(1)[:40])
+                if len(data["wakelocks"]) >= 5: break
 
-            bat = f_bat.result(); batt_sys = f_batt_sys.result(); zones = f_thermal.result()
-            mem_raw = f_meminfo.result(); df_raw = f_df.result(); stat_raw = f_stat.result()
-            cpuinfo = f_cpuinfo.result(); freq_raw = f_freq.result(); fg_raw = f_fg.result()
-            proc_raw = f_ps.result()
-            # 从合并的 ps 输出一次解析出 CPU 和 MEM 两份 Top15
-            top_procs_d = {}; top_mem_d = {}
-            for line in proc_raw.split("\n")[1:]:
-                parts = line.strip().split(None, 4)
-                if len(parts) >= 5:
-                    try:
-                        cpu = float(parts[0]); mem_pct = float(parts[1])
-                        rss = int(parts[2]); tcnt = int(parts[3])
-                        name = parts[4][:40]; pkg = parts[4].split(":")[0].split("/")[0].strip()[:50]
-                        if pkg not in top_procs_d:
-                            top_procs_d[pkg] = {"cpu": cpu, "tcnt": tcnt, "name": name, "pkg": pkg}
-                        if pkg not in top_mem_d:
-                            top_mem_d[pkg] = {"mem_pct": mem_pct, "rss": round(rss/1024,0), "tcnt": tcnt, "name": name, "pkg": pkg}
-                    except: pass
-            data["top_procs"] = sorted(top_procs_d.values(), key=lambda x: x["cpu"], reverse=True)[:15]
-            data["top_mem_procs"] = sorted(top_mem_d.values(), key=lambda x: x["mem_pct"], reverse=True)[:15]
-            wm_raw = f_wm.result(); display_raw = f_display.result()
-            wl_raw = f_power.result()
+        return data
 
+    # ===== 测试模式：并行 ThreadPoolExecutor =====
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        f_bat = ex.submit(adb, ["dumpsys", "battery"])
+        f_batt_sys = ex.submit(adb, ["cat", "/sys/class/power_supply/battery/voltage_now",
+            "/sys/class/power_supply/battery/current_now", "/sys/class/power_supply/battery/charge_type"])
+        f_thermal = ex.submit(adb, ["cat /sys/class/thermal/thermal_zone*/temp 2>/dev/null"])
+        f_meminfo = ex.submit(adb, ["cat", "/proc/meminfo"])
+        f_df = ex.submit(adb, ["df", "-h", "/data"])
+        f_stat = ex.submit(adb, ["cat", "/proc/stat"])
+        f_cpuinfo = ex.submit(adb, ["cat", "/proc/cpuinfo"])
+        f_freq = ex.submit(adb, ["cat /sys/devices/system/cpu/cpu*/cpufreq/scaling_cur_freq 2>/dev/null"])
+        f_fg = ex.submit(adb, ["dumpsys", "activity", "activities"])
+        f_ps = ex.submit(adb, ["ps", "-A", "-o", "%CPU,%MEM,RSS,TCNT,ARGS"])
+        f_wm = ex.submit(adb, ["dumpsys", "window", "policy"])
+        f_display = ex.submit(adb, ["dumpsys", "display"])
+        f_power = ex.submit(adb, ["dumpsys", "power"])
+
+        bat = f_bat.result(); batt_sys = f_batt_sys.result(); zones = f_thermal.result()
+        mem_raw = f_meminfo.result(); df_raw = f_df.result(); stat_raw = f_stat.result()
+        cpuinfo = f_cpuinfo.result(); freq_raw = f_freq.result(); fg_raw = f_fg.result()
+        proc_raw = f_ps.result()
+        # 从合并的 ps 输出一次解析出 CPU 和 MEM 两份 Top15
+        top_procs_d = {}; top_mem_d = {}
+        for line in proc_raw.split("\n")[1:]:
+            parts = line.strip().split(None, 4)
+            if len(parts) >= 5:
+                try:
+                    cpu = float(parts[0]); mem_pct = float(parts[1])
+                    rss = int(parts[2]); tcnt = int(parts[3])
+                    name = parts[4][:40]; pkg = parts[4].split(":")[0].split("/")[0].strip()[:50]
+                    if pkg not in top_procs_d:
+                        top_procs_d[pkg] = {"cpu": cpu, "tcnt": tcnt, "name": name, "pkg": pkg}
+                    if pkg not in top_mem_d:
+                        top_mem_d[pkg] = {"mem_pct": mem_pct, "rss": round(rss/1024,0), "tcnt": tcnt, "name": name, "pkg": pkg}
+                except: pass
+        data["top_procs"] = sorted(top_procs_d.values(), key=lambda x: x["cpu"], reverse=True)[:15]
+        data["top_mem_procs"] = sorted(top_mem_d.values(), key=lambda x: x["mem_pct"], reverse=True)[:15]
+        wm_raw = f_wm.result(); display_raw = f_display.result()
+        wl_raw = f_power.result()
+
+    # ===== 测试模式：解析 =====
     for line in bat.split("\n"):
         line = line.strip()
         if "temperature:" in line:
