@@ -32,6 +32,8 @@ except: MODE = "monitor"
 def save_mode():
     with open(MODE_FILE, "w") as f: f.write(MODE)
 
+PID_FILE = os.path.join(DATA_DIR, "pid.txt")
+
 # ======================= 全局状态 =======================
 prev_stat = {}
 prev_stat_lock = threading.Lock()
@@ -133,7 +135,31 @@ def get_data():
         cpuinfo = adb(["cat", "/proc/cpuinfo"])
         freq_raw = adb(["cat /sys/devices/system/cpu/cpu*/cpufreq/scaling_cur_freq 2>/dev/null"])
         fg_raw = adb(["dumpsys", "activity", "activities"])
-        proc_raw = adb(["ps -A -o \"%CPU,%MEM,RSS,TCNT,ARGS\""])
+        # V5 风格：两次独立 ps 调用，分别按 CPU/MEM 排序并解析
+        proc_raw = adb(["ps -A -o '%CPU,TCNT,ARGS' --sort=-%cpu"])
+        top_procs_d = {}
+        for line in proc_raw.split("\n")[1:]:
+            parts = line.strip().split(None, 2)
+            if len(parts) >= 3:
+                try:
+                    name = parts[2][:40]; pkg = parts[2].split(":")[0].split("/")[0].strip()[:50]
+                    if pkg not in top_procs_d:
+                        top_procs_d[pkg] = {"cpu": float(parts[0]), "tcnt": int(parts[1]), "name": name, "pkg": pkg}
+                except: pass
+        data["top_procs"] = sorted(top_procs_d.values(), key=lambda x: x["cpu"], reverse=True)[:15]
+
+        mem_proc_raw = adb(["ps -A -o '%MEM,RSS,TCNT,ARGS' --sort=-%mem"])
+        top_mem_d = {}
+        for line in mem_proc_raw.split("\n")[1:]:
+            parts = line.strip().split(None, 3)
+            if len(parts) >= 4:
+                try:
+                    name = parts[3][:40]; pkg = parts[3].split(":")[0].split("/")[0].strip()[:50]
+                    if pkg not in top_mem_d:
+                        top_mem_d[pkg] = {"mem_pct": float(parts[0]), "rss": round(int(parts[1])/1024,0), "tcnt": int(parts[2]), "name": name, "pkg": pkg}
+                except: pass
+        data["top_mem_procs"] = sorted(top_mem_d.values(), key=lambda x: x["mem_pct"], reverse=True)[:15]
+
         wm_raw = adb(["dumpsys", "window", "policy"])
         display_raw = adb(["dumpsys", "display"])
         wl_raw = adb(["dumpsys", "power"])
@@ -159,6 +185,22 @@ def get_data():
             mem_raw = f_meminfo.result(); df_raw = f_df.result(); stat_raw = f_stat.result()
             cpuinfo = f_cpuinfo.result(); freq_raw = f_freq.result(); fg_raw = f_fg.result()
             proc_raw = f_ps.result()
+            # 从合并的 ps 输出一次解析出 CPU 和 MEM 两份 Top15
+            top_procs_d = {}; top_mem_d = {}
+            for line in proc_raw.split("\n")[1:]:
+                parts = line.strip().split(None, 4)
+                if len(parts) >= 5:
+                    try:
+                        cpu = float(parts[0]); mem_pct = float(parts[1])
+                        rss = int(parts[2]); tcnt = int(parts[3])
+                        name = parts[4][:40]; pkg = parts[4].split(":")[0].split("/")[0].strip()[:50]
+                        if pkg not in top_procs_d:
+                            top_procs_d[pkg] = {"cpu": cpu, "tcnt": tcnt, "name": name, "pkg": pkg}
+                        if pkg not in top_mem_d:
+                            top_mem_d[pkg] = {"mem_pct": mem_pct, "rss": round(rss/1024,0), "tcnt": tcnt, "name": name, "pkg": pkg}
+                    except: pass
+            data["top_procs"] = sorted(top_procs_d.values(), key=lambda x: x["cpu"], reverse=True)[:15]
+            data["top_mem_procs"] = sorted(top_mem_d.values(), key=lambda x: x["mem_pct"], reverse=True)[:15]
             wm_raw = f_wm.result(); display_raw = f_display.result()
             wl_raw = f_power.result()
 
@@ -255,23 +297,6 @@ def get_data():
                 if "/" in p and "." in p: fg_app = p.split("/")[0]; break
             if fg_app: break
     data["fg_app"] = fg_app[:50] if fg_app else "未知"
-
-    # 单次 ps -A，含 %CPU,%MEM,RSS,TCNT,ARGS，一次解析出 CPU 和内存两份 Top15
-    top_procs_d = {}; top_mem_d = {}
-    for line in proc_raw.split("\n")[1:]:
-        parts = line.strip().split(None, 4)
-        if len(parts) >= 5:
-            try:
-                cpu = float(parts[0]); mem_pct = float(parts[1])
-                rss = int(parts[2]); tcnt = int(parts[3])
-                name = parts[4][:40]; pkg = parts[4].split(":")[0].split("/")[0].strip()[:50]
-                if pkg not in top_procs_d:
-                    top_procs_d[pkg] = {"cpu": cpu, "tcnt": tcnt, "name": name, "pkg": pkg}
-                if pkg not in top_mem_d:
-                    top_mem_d[pkg] = {"mem_pct": mem_pct, "rss": round(rss/1024,0), "tcnt": tcnt, "name": name, "pkg": pkg}
-            except: pass
-    data["top_procs"] = sorted(top_procs_d.values(), key=lambda x: x["cpu"], reverse=True)[:15]
-    data["top_mem_procs"] = sorted(top_mem_d.values(), key=lambda x: x["mem_pct"], reverse=True)[:15]
 
     data["screen_on"] = "SCREEN_STATE_ON" in wm_raw
     for line in display_raw.split("\n"):
@@ -1724,6 +1749,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
 # ======================= Main =======================
 
 def main():
+    # 启动时清理僵尸进程
+    if os.path.exists(PID_FILE):
+        try:
+            with open(PID_FILE) as f: old_pid = int(f.read().strip())
+            subprocess.run(["taskkill", "/f", "/pid", str(old_pid)], capture_output=True, timeout=3)
+        except: pass
+
+    with open(PID_FILE, "w") as f:
+        f.write(str(os.getpid()))
+
     print("启动手机监控仪表盘 v6 ...")
     load_persisted_data()
     ct = threading.Thread(target=charge_sample_thread, daemon=True); ct.start()
