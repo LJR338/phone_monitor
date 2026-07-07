@@ -1261,12 +1261,18 @@ function queryGfx() {
 }
 
 // ===== v6 - 网络流量 =====
+function fmtSize(kb) {
+    if (kb >= 1048576) return (kb / 1048576).toFixed(2) + ' GB';
+    if (kb >= 1024) return (kb / 1024).toFixed(1) + ' MB';
+    return kb.toFixed(1) + ' KB';
+}
+
 function queryTraffic() {
     document.getElementById('trafficResult').innerHTML = '<div style="color:#FF9800;padding:10px">查询中...</div>';
     fetch('/traffic').then(r=>r.json()).then(data=>{
-        let rows = data.map((a,i)=>'<tr><td>'+(i+1)+'</td><td>'+a.pkg+'</td><td>'+a.rx_kb+'</td><td>'+a.tx_kb+'</td><td style="font-weight:bold">'+a.total_kb+'</td></tr>').join('');
+        let rows = data.map((a,i)=>'<tr><td>'+(i+1)+'</td><td>'+a.pkg+'</td><td>'+fmtSize(a.rx_kb)+'</td><td>'+fmtSize(a.tx_kb)+'</td><td style="font-weight:bold">'+fmtSize(a.total_kb)+'</td></tr>').join('');
         document.getElementById('trafficResult').innerHTML =
-        '<div class="table-card"><table width="100%"><tr><th>#</th><th>应用</th><th>接收KB</th><th>发送KB</th><th>总流量KB</th></tr>'+rows+'</table></div>';
+        '<div class="table-card"><table width="100%"><tr><th>#</th><th>应用</th><th>接收</th><th>发送</th><th>总流量</th></tr>'+rows+'</table></div>';
     });
 }
 
