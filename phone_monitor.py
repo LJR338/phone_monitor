@@ -144,10 +144,14 @@ def get_data():
                     data["charging"] = s == 2
                 except: data["charge_status"] = "?"
 
+        time.sleep(0.03)
+
         # 电压
         volt_raw = adb(["cat", "/sys/class/power_supply/battery/voltage_now"])
         try: data["bat_voltage"] = int(volt_raw) / 1000000
         except: data["bat_voltage"] = 0
+
+        time.sleep(0.03)
 
         # 电流
         curr = adb(["cat", "/sys/class/power_supply/battery/current_now"])
@@ -159,9 +163,13 @@ def get_data():
         else: data["charge_power"] = 0
         data["discharge_ma"] = round(curr_ma, 0) if not data.get("charging") and curr_ma > 0 else 0
 
+        time.sleep(0.03)
+
         # 充电类型
         chtype = adb(["cat", "/sys/class/power_supply/battery/charge_type"])
         data["charge_type"] = chtype if chtype else "?"
+
+        time.sleep(0.03)
 
         # SoC 温区
         zones = adb(["cat /sys/class/thermal/thermal_zone*/temp 2>/dev/null"])
@@ -171,6 +179,8 @@ def get_data():
                 try: temps.append(int(t.strip()) / 1000)
                 except: pass
         data["soc_max"] = round(max(temps), 1) if temps else 0
+
+        time.sleep(0.03)
 
         # 内存
         mem_raw = adb(["cat", "/proc/meminfo"])
@@ -187,11 +197,15 @@ def get_data():
         swap_free = mem.get("SwapFree", 0) / 1048576
         data["swap_pct"] = round((1 - swap_free / max(swap_total, 1)) * 100, 1) if swap_total > 0 else 0
 
+        time.sleep(0.03)
+
         # 存储
         df_raw = adb(["df", "-h", "/data"])
         m = re.search(r'/data\s+(\d+\.?\d*[MG])\s+\d+\.?\d*[MG]\s+(\d+\.?\d*[MG])\s+(\d+)%', df_raw) if df_raw else None
         if m: data["disk_total"], data["disk_free"], data["disk_pct"] = m.group(1), m.group(2), int(m.group(3))
         else: data["disk_total"], data["disk_free"], data["disk_pct"] = "?", "?", 0
+
+        time.sleep(0.03)
 
         # /proc/stat
         stat_raw = adb(["cat", "/proc/stat"])
@@ -216,6 +230,8 @@ def get_data():
         data["cpu_idle_pct"] = cpu_total_idle_pct
         data["per_core"] = per_core
 
+        time.sleep(0.03)
+
         # CPU 频率
         cpuinfo = adb(["cat", "/proc/cpuinfo"])
         data["cpu_cores"] = cpuinfo.count("processor\t:")
@@ -228,6 +244,8 @@ def get_data():
         data["cpu_freq_avg"] = round(sum(freqs) / len(freqs), 0) if freqs else 0
         data["per_core_freqs"] = freqs
 
+        time.sleep(0.03)
+
         # 前台应用
         fg_raw = adb(["dumpsys", "activity", "activities"])
         fg_app = ""
@@ -238,6 +256,8 @@ def get_data():
                     if "/" in p and "." in p: fg_app = p.split("/")[0]; break
                 if fg_app: break
         data["fg_app"] = fg_app[:50] if fg_app else "未知"
+
+        time.sleep(0.03)
 
         # CPU 进程 TOP15
         proc_raw = adb(["ps -A -o '%CPU,TCNT,ARGS' --sort=-%cpu"])
@@ -253,6 +273,8 @@ def get_data():
                     data["top_procs"].append({"cpu": float(parts[0]), "tcnt": int(parts[1]), "name": name, "pkg": pkg})
                 except: pass
 
+        time.sleep(0.03)
+
         # 内存进程 TOP15
         mem_proc_raw = adb(["ps -A -o '%MEM,RSS,TCNT,ARGS' --sort=-%mem"])
         data["top_mem_procs"] = []; seen_mem = set()
@@ -267,9 +289,12 @@ def get_data():
                     data["top_mem_procs"].append({"mem_pct": float(parts[0]), "rss": round(int(parts[1])/1024,0), "tcnt": int(parts[2]), "name": name, "pkg": pkg})
                 except: pass
 
+        time.sleep(0.03)
+
         # 屏幕
         wm_raw = adb(["dumpsys", "window", "policy"])
         data["screen_on"] = "SCREEN_STATE_ON" in wm_raw
+        time.sleep(0.03)
         display_raw = adb(["dumpsys", "display"])
         for line in display_raw.split("\n"):
             if "fps=" in line and "activeModeId" not in line:
@@ -277,6 +302,8 @@ def get_data():
                     if "fps=" in part:
                         try: data["fps"] = part.split("=")[1].strip()
                         except: pass
+
+        time.sleep(0.03)
 
         # Wakelocks
         wl_raw = adb(["dumpsys", "power"])
@@ -287,6 +314,8 @@ def get_data():
                 m2 = re.match(r'\s*Wake Lock (\S+)', line)
                 if m2: data["wakelocks"].append(m2.group(1)[:40])
                 if len(data["wakelocks"]) >= 5: break
+
+        time.sleep(0.03)
 
         return data
 
