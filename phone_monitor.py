@@ -765,7 +765,12 @@ def start_monkey(pkg, count=1000, throttle=200):
 def stop_monkey(stream_id):
     with monkey_lock:
         s = monkey_streams.get(stream_id)
-        if s: s["stop"].set()
+        if s:
+            s["stop"].set()
+            # 直接杀掉设备端和本地的 monkey 进程，否则 stop 标记无法中断阻塞的 stdout 读取
+            subprocess.run([ADB, "shell", "killall", "monkey"], capture_output=True, timeout=3)
+            try: s["proc"].terminate()
+            except: pass
     return True
 
 
