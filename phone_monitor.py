@@ -603,30 +603,50 @@ def get_gfxinfo(pkg):
 
 def get_net_traffic():
     """获取所有 App 网络流量"""
-    apps = []
-    # 先获取所有包名和 uid
-    raw = adb(["dumpsys","netstats","detail"])
-    # 解析每个包的网络统计
-    # 格式: NetworkStats: ... uid=XXXXX set=...
+    # 使用较长超时，dumpsys netstats 数据量大时很慢
+    try:
+        raw = subprocess.run([ADB, "shell", "dumpsys", "netstats", "detail"],
+                             capture_output=True, text=True, timeout=15).stdout
+    except:
+        return []
     seen = {}
+    # 逐行解析 uid + 流量计数，兼容字段在不同行的情况
+    current_uid = None
     for line in raw.split("\n"):
-        m = re.search(r'uid=(\d+).*?tag=0x0.*?rb=(\d+).*?rp=(\d+).*?tb=(\d+).*?tp=(\d+)', line)
-        if m:
-            uid = int(m.group(1))
-            rx = int(m.group(2)) + int(m.group(3))
-            tx = int(m.group(4)) + int(m.group(5))
-            if uid in seen:
-                seen[uid]["rx"] += rx; seen[uid]["tx"] += tx
-            else:
-                seen[uid] = {"uid": uid, "rx": rx, "tx": tx, "pkg": f"uid_{uid}"}
-    # 尝试解析包名
-    pkg_raw = adb(["pm","list","packages","-U"])
+        # 捕获 uid
+        m_uid = re.search(r'uid=(\d+)', line)
+        if m_uid:
+            current_uid = int(m_uid.group(1))
+        if current_uid is None:
+            continue
+        # 只统计 tag=0x0（默认标记）避免重复
+        if "tag=0x0" not in line:
+            continue
+        rb = re.search(r'rb=(\d+)', line)
+        rp = re.search(r'rp=(\d+)', line)
+        tb = re.search(r'tb=(\d+)', line)
+        tp = re.search(r'tp=(\d+)', line)
+        rx = (int(rb.group(1)) if rb else 0) + (int(rp.group(1)) if rp else 0)
+        tx = (int(tb.group(1)) if tb else 0) + (int(tp.group(1)) if tp else 0)
+        if rx == 0 and tx == 0:
+            continue
+        if current_uid in seen:
+            seen[current_uid]["rx"] += rx; seen[current_uid]["tx"] += tx
+        else:
+            seen[current_uid] = {"uid": current_uid, "rx": rx, "tx": tx, "pkg": f"uid_{current_uid}"}
+    # 解析 uid → 包名
+    try:
+        pkg_raw = subprocess.run([ADB, "shell", "pm", "list", "packages", "-U"],
+                                 capture_output=True, text=True, timeout=10).stdout
+    except:
+        pkg_raw = ""
     uid_to_pkg = {}
     for line in pkg_raw.split("\n"):
         mp = re.match(r'package:(\S+)\s+uid:(\d+)', line)
         if mp: uid_to_pkg[int(mp.group(2))] = mp.group(1)
+    apps = []
     for uid, info in seen.items():
-        info["pkg"] = uid_to_pkg.get(uid, f"uid_{uid}")
+        info["pkg"] = uid_to_pkg.get(uid, info["pkg"])
         total_kb = (info["rx"] + info["tx"]) / 1024
         apps.append({"pkg": info["pkg"], "uid": uid,
                      "rx_kb": round(info["rx"]/1024, 1),
