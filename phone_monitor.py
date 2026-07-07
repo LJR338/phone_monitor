@@ -755,6 +755,7 @@ def start_monkey(pkg, count=1000, throttle=200):
                 monkey_results.append({"pkg": pkg, "time": time.strftime("%H:%M:%S"),
                                         "events": events_injected, "crashes": crashes, "anrs": anrs,
                                         "total": count})
+            q.put({"done":True, "events":events_injected, "crashes":crashes, "anrs":anrs, "total":count})
             with monkey_lock: monkey_streams.pop(stream_id, None)
 
     threading.Thread(target=reader, daemon=True).start()
@@ -1295,6 +1296,7 @@ function stopMonkey() {
     monkeyActive = false;
     document.getElementById('monkeyBtn').textContent = '开始压测';
     document.getElementById('monkeyBtn').style.background = '#2ea043';
+    document.getElementById('monkeyStatus').innerHTML = '<div class="monkey-status monkey-stopped">已停止</div>';
     if(monkeyEs){monkeyEs.close();monkeyEs=null;}
     fetch('/monkey/stop',{method:'POST'}).catch(()=>{});
 }
@@ -1524,10 +1526,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 while not stop.is_set():
                     try:
                         line = q.get(timeout=1)
+                        if isinstance(line, dict) and line.get("done"):
+                            # 自然完成：直接推送 done 并退出
+                            sse.send({"done":True,"events":line.get("events",0),"total":count,"crashes":line.get("crashes",0)})
+                            return
                         sse.send(line)
                     except queue.Empty:
                         sse.heartbeat()
-                # 汇总
+                # 手动停止
                 with monkey_results_lock:
                     recent = list(monkey_results)
                 last = recent[-1] if recent else {"events":0,"crashes":0,"anrs":0}
