@@ -610,22 +610,29 @@ def get_net_traffic():
     except:
         return []
     seen = {}
-    # 逐行解析 uid + 流量计数，兼容字段在不同行的情况
+    # HyperOS/Android 13+ 格式：uid 在 ident 行，流量数据在后续 st= 行
+    # ident=[{...}] uid=10354 set=DEFAULT tag=0x0
+    #     NetworkStatsHistory: bucketDuration=7200
+    #         st=1783188000 rb=4649 rp=12 tb=2633 tp=13 op=0
     current_uid = None
     for line in raw.split("\n"):
-        # 捕获 uid
         m_uid = re.search(r'uid=(\d+)', line)
         if m_uid:
-            current_uid = int(m_uid.group(1))
-        if current_uid is None:
+            uid_val = int(m_uid.group(1))
+            # 只统计有效 uid（排除 uid=-1 设备汇总和 uid=0 系统），且需要 tag=0x0
+            if uid_val > 0 and "tag=0x0" in line:
+                current_uid = uid_val
+            else:
+                current_uid = None
             continue
-        # 只统计 tag=0x0（默认标记）避免重复
-        if "tag=0x0" not in line:
+        if current_uid is None:
             continue
         rb = re.search(r'rb=(\d+)', line)
         rp = re.search(r'rp=(\d+)', line)
         tb = re.search(r'tb=(\d+)', line)
         tp = re.search(r'tp=(\d+)', line)
+        if not (rb or rp or tb or tp):
+            continue
         rx = (int(rb.group(1)) if rb else 0) + (int(rp.group(1)) if rp else 0)
         tx = (int(tb.group(1)) if tb else 0) + (int(tp.group(1)) if tp else 0)
         if rx == 0 and tx == 0:

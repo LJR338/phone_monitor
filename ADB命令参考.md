@@ -1,3 +1,14 @@
+---
+AIGC:
+    Label: "1"
+    ContentProducer: 001191440300708461136T1XGW3
+    ProduceID: 51997d6c3c77c8dc461853b32b973179_ad19629079a611f19641525400d9a7a1
+    ReservedCode1: lqwzVLdq8JhstESukq3L1Hf/KDIzmky5agDxe0CHT1niVcgZTSZlVf0xF+go7A60f+SSxbjwbOr+Zc1kfGjSMcUkT8RLjG3nd159tNoxetxuZCl1BMHSaqbPzmsxAYrE3wCPyiTTEpsnQ13CceWppaPjTWYo6nNKJ9I7ar3824qjSlGqwd6S3/mlgRk=
+    ContentPropagator: 001191440300708461136T1XGW3
+    PropagateID: 51997d6c3c77c8dc461853b32b973179_ad19629079a611f19641525400d9a7a1
+    ReservedCode2: lqwzVLdq8JhstESukq3L1Hf/KDIzmky5agDxe0CHT1niVcgZTSZlVf0xF+go7A60f+SSxbjwbOr+Zc1kfGjSMcUkT8RLjG3nd159tNoxetxuZCl1BMHSaqbPzmsxAYrE3wCPyiTTEpsnQ13CceWppaPjTWYo6nNKJ9I7ar3824qjSlGqwd6S3/mlgRk=
+---
+
 # ADB 命令参考手册
 
 > 适用于 MIUI / HyperOS，大部分命令通用 Android。标注 `[root]` 需 root 权限，标注 `[核]` 需内核支持。
@@ -393,3 +404,4 @@
 | PowerKeeper 参数调优 | 不可用 | 闭源组件，无对外配置接口 |
 | 内核唤醒源追踪 | 不可用 | `/sys/kernel/debug/wakeup_sources` 需 root |
 | 逐应用 CPU 限频 | 不可用 | 需 root + 内核 cgroup 调参 |
+*（内容由AI生成，仅供参考）*
