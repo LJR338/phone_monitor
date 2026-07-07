@@ -13,6 +13,7 @@ import os
 import sys
 import collections
 import math
+from concurrent.futures import ThreadPoolExecutor
 import tempfile
 import queue
 import uuid
@@ -108,7 +109,28 @@ def get_data():
     global prev_stat
     data = {"time": time.strftime("%H:%M:%S"), "timestamp": time.time()}
 
-    bat = adb(["dumpsys", "battery"])
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        f_bat = ex.submit(adb, ["dumpsys", "battery"])
+        f_batt_sys = ex.submit(adb, ["cat", "/sys/class/power_supply/battery/voltage_now",
+            "/sys/class/power_supply/battery/current_now", "/sys/class/power_supply/battery/charge_type"])
+        f_thermal = ex.submit(adb, ["cat /sys/class/thermal/thermal_zone*/temp 2>/dev/null"])
+        f_meminfo = ex.submit(adb, ["cat", "/proc/meminfo"])
+        f_df = ex.submit(adb, ["df", "-h", "/data"])
+        f_stat = ex.submit(adb, ["cat", "/proc/stat"])
+        f_cpuinfo = ex.submit(adb, ["cat", "/proc/cpuinfo"])
+        f_freq = ex.submit(adb, ["cat /sys/devices/system/cpu/cpu*/cpufreq/scaling_cur_freq 2>/dev/null"])
+        f_fg = ex.submit(adb, ["dumpsys", "activity", "activities"])
+        f_ps = ex.submit(adb, ["ps", "-A", "-o", "%CPU,%MEM,RSS,TCNT,ARGS"])
+        f_wm = ex.submit(adb, ["dumpsys", "window", "policy"])
+        f_display = ex.submit(adb, ["dumpsys", "display"])
+        f_power = ex.submit(adb, ["dumpsys", "power"])
+
+        bat = f_bat.result(); batt_sys = f_batt_sys.result(); zones = f_thermal.result()
+        mem_raw = f_meminfo.result(); df_raw = f_df.result(); stat_raw = f_stat.result()
+        cpuinfo = f_cpuinfo.result(); freq_raw = f_freq.result(); fg_raw = f_fg.result()
+        proc_raw = f_ps.result(); wm_raw = f_wm.result(); display_raw = f_display.result()
+        wl_raw = f_power.result()
+
     for line in bat.split("\n"):
         line = line.strip()
         if "temperature:" in line:
@@ -127,23 +149,19 @@ def get_data():
                 data["charging"] = s == 2
             except: data["charge_status"] = "?"
 
-    volt_raw = adb(["cat", "/sys/class/power_supply/battery/voltage_now"])
-    try: data["bat_voltage"] = int(volt_raw) / 1000000
-    except: data["bat_voltage"] = 0
-
-    curr = adb(["cat", "/sys/class/power_supply/battery/current_now"])
-    try:
-        curr_val = int(curr); curr_ma = abs(curr_val) / 1000 if curr else 0
-    except:
-        curr_ma = curr_val = 0
+    bs_lines = batt_sys.strip().split("\n")
+    if len(bs_lines) >= 1:
+        try: data["bat_voltage"] = int(bs_lines[0].strip()) / 1000000
+        except: data["bat_voltage"] = 0
+    if len(bs_lines) >= 2:
+        try: curr_val = int(bs_lines[1].strip()); curr_ma = abs(curr_val) / 1000 if bs_lines[1].strip() else 0
+        except: curr_ma = 0
+    else: curr_ma = 0
     data["charge_current"] = round(curr_ma, 0)
     data["charge_power"] = round(curr_ma * data.get("bat_voltage", 0) / 1000, 1) if data.get("bat_voltage", 0) > 0 and curr_ma > 0 else 0
     data["discharge_ma"] = round(curr_ma, 0) if not data.get("charging") and curr_ma > 0 else 0
+    data["charge_type"] = bs_lines[2].strip() if len(bs_lines) >= 3 and bs_lines[2].strip() else "?"
 
-    chtype = adb(["cat", "/sys/class/power_supply/battery/charge_type"])
-    data["charge_type"] = chtype if chtype else "?"
-
-    zones = adb(["cat /sys/class/thermal/thermal_zone*/temp 2>/dev/null"])
     temps = []
     if zones:
         for t in zones.split("\n"):
@@ -151,7 +169,6 @@ def get_data():
             except: pass
     data["soc_max"] = round(max(temps), 1) if temps else 0
 
-    mem_raw = adb(["cat", "/proc/meminfo"])
     mem = {}
     for line in mem_raw.split("\n"):
         parts = line.split(":")
@@ -165,12 +182,10 @@ def get_data():
     swap_free = mem.get("SwapFree", 0) / 1048576
     data["swap_pct"] = round((1 - swap_free / max(swap_total, 1)) * 100, 1) if swap_total > 0 else 0
 
-    df_raw = adb(["df", "-h", "/data"])
     m = re.search(r'/data\s+(\d+\.?\d*[MG])\s+\d+\.?\d*[MG]\s+(\d+\.?\d*[MG])\s+(\d+)%', df_raw) if df_raw else None
     if m: data["disk_total"], data["disk_free"], data["disk_pct"] = m.group(1), m.group(2), int(m.group(3))
     else: data["disk_total"], data["disk_free"], data["disk_pct"] = "?", "?", 0
 
-    stat_raw = adb(["cat", "/proc/stat"])
     cpu_total_idle_pct = 0; per_core = []; now_stat = {}
     if stat_raw:
         for line in stat_raw.split("\n"):
@@ -192,9 +207,7 @@ def get_data():
     data["cpu_idle_pct"] = cpu_total_idle_pct
     data["per_core"] = per_core
 
-    cpuinfo = adb(["cat", "/proc/cpuinfo"])
     data["cpu_cores"] = cpuinfo.count("processor\t:")
-    freq_raw = adb(["cat /sys/devices/system/cpu/cpu*/cpufreq/scaling_cur_freq 2>/dev/null"])
     freqs = []
     if freq_raw:
         for f in freq_raw.split("\n"):
@@ -203,7 +216,6 @@ def get_data():
     data["cpu_freq_avg"] = round(sum(freqs) / len(freqs), 0) if freqs else 0
     data["per_core_freqs"] = freqs
 
-    fg_raw = adb(["dumpsys", "activity", "activities"])
     fg_app = ""
     for line in fg_raw.split("\n"):
         if "mResumedActivity" in line or "mFocusedApp" in line:
@@ -213,35 +225,24 @@ def get_data():
             if fg_app: break
     data["fg_app"] = fg_app[:50] if fg_app else "未知"
 
-    proc_raw = adb(["ps -A -o '%CPU,TCNT,ARGS' --sort=-%cpu"])
-    data["top_procs"] = []; seen_cpu = set()
+    # 单次 ps -A，含 %CPU,%MEM,RSS,TCNT,ARGS，一次解析出 CPU 和内存两份 Top15
+    top_procs_d = {}; top_mem_d = {}
     for line in proc_raw.split("\n")[1:]:
-        if len(data["top_procs"]) >= 15: break
-        parts = line.strip().split(None, 2)
-        if len(parts) >= 3:
+        parts = line.strip().split(None, 4)
+        if len(parts) >= 5:
             try:
-                name = parts[2][:40]; pkg = parts[2].split(":")[0].split("/")[0].strip()[:50]
-                if pkg in seen_cpu: continue
-                seen_cpu.add(pkg)
-                data["top_procs"].append({"cpu": float(parts[0]), "tcnt": int(parts[1]), "name": name, "pkg": pkg})
+                cpu = float(parts[0]); mem_pct = float(parts[1])
+                rss = int(parts[2]); tcnt = int(parts[3])
+                name = parts[4][:40]; pkg = parts[4].split(":")[0].split("/")[0].strip()[:50]
+                if pkg not in top_procs_d:
+                    top_procs_d[pkg] = {"cpu": cpu, "tcnt": tcnt, "name": name, "pkg": pkg}
+                if pkg not in top_mem_d:
+                    top_mem_d[pkg] = {"mem_pct": mem_pct, "rss": round(rss/1024,0), "tcnt": tcnt, "name": name, "pkg": pkg}
             except: pass
+    data["top_procs"] = sorted(top_procs_d.values(), key=lambda x: x["cpu"], reverse=True)[:15]
+    data["top_mem_procs"] = sorted(top_mem_d.values(), key=lambda x: x["mem_pct"], reverse=True)[:15]
 
-    mem_proc_raw = adb(["ps -A -o '%MEM,RSS,TCNT,ARGS' --sort=-%mem"])
-    data["top_mem_procs"] = []; seen_mem = set()
-    for line in mem_proc_raw.split("\n")[1:]:
-        if len(data["top_mem_procs"]) >= 15: break
-        parts = line.strip().split(None, 3)
-        if len(parts) >= 4:
-            try:
-                name = parts[3][:40]; pkg = parts[3].split(":")[0].split("/")[0].strip()[:50]
-                if pkg in seen_mem: continue
-                seen_mem.add(pkg)
-                data["top_mem_procs"].append({"mem_pct": float(parts[0]), "rss": round(int(parts[1])/1024,0), "tcnt": int(parts[2]), "name": name, "pkg": pkg})
-            except: pass
-
-    wm_raw = adb(["dumpsys", "window", "policy"])
     data["screen_on"] = "SCREEN_STATE_ON" in wm_raw
-    display_raw = adb(["dumpsys", "display"])
     for line in display_raw.split("\n"):
         if "fps=" in line and "activeModeId" not in line:
             for part in line.split(","):
@@ -249,7 +250,6 @@ def get_data():
                     try: data["fps"] = part.split("=")[1].strip()
                     except: pass
 
-    wl_raw = adb(["dumpsys", "power"])
     data["wakelocks"] = []; in_section = False
     for line in wl_raw.split("\n"):
         if "Wake Locks: size=" in line: in_section = True; continue
@@ -257,6 +257,85 @@ def get_data():
             m2 = re.match(r'\s*Wake Lock (\S+)', line)
             if m2: data["wakelocks"].append(m2.group(1)[:40])
             if len(data["wakelocks"]) >= 5: break
+    return data
+
+
+def get_core_data():
+    """快速返回核心指标：电池/温度/CPU/内存/屏幕。不包含进程列表，用于首次渲染。"""
+    global prev_stat
+    data = {"time": time.strftime("%H:%M:%S"), "timestamp": time.time()}
+
+    with ThreadPoolExecutor(max_workers=5) as ex:
+        f_bat = ex.submit(adb, ["dumpsys", "battery"])
+        f_batt_sys = ex.submit(adb, ["cat", "/sys/class/power_supply/battery/voltage_now",
+            "/sys/class/power_supply/battery/current_now",
+            "/sys/class/power_supply/battery/charge_type"])
+        f_memhead = ex.submit(adb, ["cat /proc/meminfo | head -5"])
+        f_stathead = ex.submit(adb, ["cat /proc/stat | head -5"])
+        f_wm = ex.submit(adb, ["dumpsys", "window", "policy"])
+
+        bat = f_bat.result(); batt_sys = f_batt_sys.result()
+        mem_raw = f_memhead.result(); stat_raw = f_stathead.result()
+        wm_raw = f_wm.result()
+
+    for line in bat.split("\n"):
+        line = line.strip()
+        if "temperature:" in line:
+            try: data["temp"] = int(line.split(":")[1].strip()) / 10
+            except: data["temp"] = 0
+        elif "level:" in line:
+            try: data["bat_level"] = int(line.split(":")[1].strip())
+            except: data["bat_level"] = 0
+        elif "status:" in line:
+            try:
+                s = int(line.split(":")[1].strip())
+                data["charge_status"] = {2:"充电中",3:"放电中",4:"未充电",5:"已充满"}.get(s, "未知")
+                data["charging"] = s == 2
+            except: data["charge_status"] = "?"
+
+    bs_lines = batt_sys.strip().split("\n")
+    if len(bs_lines) >= 1:
+        try: data["bat_voltage"] = int(bs_lines[0].strip()) / 1000000
+        except: data["bat_voltage"] = 0
+    if len(bs_lines) >= 2:
+        try: curr_val = int(bs_lines[1].strip()); curr_ma = abs(curr_val) / 1000 if bs_lines[1].strip() else 0
+        except: curr_ma = 0
+    else: curr_ma = 0
+    data["charge_current"] = round(curr_ma, 0)
+    data["charge_power"] = round(curr_ma * data.get("bat_voltage", 0) / 1000, 1) if data.get("bat_voltage", 0) > 0 and curr_ma > 0 else 0
+
+    mem = {}
+    for line in mem_raw.split("\n"):
+        parts = line.split(":")
+        if len(parts) == 2:
+            try: mem[parts[0].strip()] = int(parts[1].strip().split()[0])
+            except: pass
+    data["mem_total"] = round(mem.get("MemTotal", 0) / 1048576, 1)
+    data["mem_avail"] = round(mem.get("MemAvailable", 0) / 1048576, 1)
+    data["mem_used_pct"] = round((1 - mem.get("MemAvailable", 0) / max(mem.get("MemTotal", 1), 1)) * 100, 1)
+
+    cpu_total_idle_pct = 0; per_core = []; now_stat = {}
+    if stat_raw:
+        for line in stat_raw.split("\n"):
+            fields = line.split()
+            if len(fields) >= 5 and fields[0].startswith("cpu"):
+                vals = [int(x) for x in fields[1:8]]
+                now_stat[fields[0]] = {"total": sum(vals), "idle": vals[3] + vals[4]}
+    with prev_stat_lock:
+        if prev_stat and now_stat:
+            for core, nv in now_stat.items():
+                pv = prev_stat.get(core)
+                if pv and nv["total"] > pv["total"]:
+                    dt, di = nv["total"] - pv["total"], nv["idle"] - pv["idle"]
+                    idle_pct = round(di / dt * 100, 1) if dt > 0 else 0
+                    if core == "cpu": cpu_total_idle_pct = idle_pct
+                    else: per_core.append({"core": core, "idle_pct": idle_pct})
+            per_core.sort(key=lambda x: int(x["core"].replace("cpu", "")) if x["core"].replace("cpu", "").isdigit() else 999)
+        prev_stat = now_stat
+    data["cpu_idle_pct"] = cpu_total_idle_pct
+    data["per_core"] = per_core
+
+    data["screen_on"] = "SCREEN_STATE_ON" in wm_raw
     return data
 
 
@@ -940,7 +1019,23 @@ function drawChart(history, canvasId, key, color, label, maxVal) {
 }
 
 // ===== 仪表盘渲染 =====
-function renderDash(d) { /* 保持原有逻辑 */
+let dashFirstPaint = true;
+
+function buildProcRows(topProcs, topMemProcs) {
+    let procRows=""; (topProcs||[]).forEach((p,i)=>{
+        const clr=p.cpu<5?"#4CAF50":p.cpu<15?"#FF9800":"#F44336";
+        let pkg=p.pkg||extractPkg(p.name), killBtn=pkg?'<span class="kill-btn" onclick="killProcess(\''+pkg+'\',this)">X</span>':'';
+        procRows+="<tr><td>"+(i+1)+"</td><td><span class='process-name'>"+p.name+"</span>"+killBtn+"</td><td style='text-align:center'>"+(p.tcnt||0)+"</td><td style='color:"+clr+";font-weight:bold'>"+p.cpu.toFixed(1)+"%</td></tr>";
+    });
+    let memProcRows=""; (topMemProcs||[]).forEach((p,i)=>{
+        const clr=p.mem_pct<2?"#4CAF50":p.mem_pct<5?"#FF9800":"#F44336";
+        let pkg=p.pkg||extractPkg(p.name), killBtn=pkg?'<span class="kill-btn" onclick="killProcess(\''+pkg+'\',this)">X</span>':'';
+        memProcRows+="<tr><td>"+(i+1)+"</td><td><span class='process-name'>"+p.name+"</span>"+killBtn+"</td><td>"+p.mem_pct.toFixed(1)+"%</td><td>"+p.rss+" MB</td></tr>";
+    });
+    return [procRows, memProcRows];
+}
+
+function renderDash(d) {
     const batPct = d.bat_level||0;
     const batClr = batPct>50?"#4CAF50":batPct>20?"#FF9800":"#F44336";
     const chgClr = d.charging?"#4CAF50":"#484f58";
@@ -951,16 +1046,7 @@ function renderDash(d) { /* 保持原有逻辑 */
         let pct=Math.min(f/3000*100,100),clr=f>2000?"#F44336":f>1000?"#FF9800":"#4CAF50";
         coreBars+='<span class="core-label">C'+i+'</span><span class="core-bar"><span class="core-bar-fill" style="width:'+pct+'%;background:'+clr+'"></span></span>';
     });
-    let procRows=""; (d.top_procs||[]).forEach((p,i)=>{
-        const clr=p.cpu<5?"#4CAF50":p.cpu<15?"#FF9800":"#F44336";
-        let pkg=p.pkg||extractPkg(p.name), killBtn=pkg?'<span class="kill-btn" onclick="killProcess(\''+pkg+'\',this)">X</span>':'';
-        procRows+="<tr><td>"+(i+1)+"</td><td><span class='process-name'>"+p.name+"</span>"+killBtn+"</td><td style='text-align:center'>"+(p.tcnt||0)+"</td><td style='color:"+clr+";font-weight:bold'>"+p.cpu.toFixed(1)+"%</td></tr>";
-    });
-    let memProcRows=""; (d.top_mem_procs||[]).forEach((p,i)=>{
-        const clr=p.mem_pct<2?"#4CAF50":p.mem_pct<5?"#FF9800":"#F44336";
-        let pkg=p.pkg||extractPkg(p.name), killBtn=pkg?'<span class="kill-btn" onclick="killProcess(\''+pkg+'\',this)">X</span>':'';
-        memProcRows+="<tr><td>"+(i+1)+"</td><td><span class='process-name'>"+p.name+"</span>"+killBtn+"</td><td>"+p.mem_pct.toFixed(1)+"%</td><td>"+p.rss+" MB</td></tr>";
-    });
+    let [procRows, memProcRows] = buildProcRows(d.top_procs, d.top_mem_procs);
     let html='<div class="grid">';
     html+='<div class="card"><div class="card-title">温度</div><div class="big-num" style="color:'+tc(d.temp)+'">'+(d.temp||0).toFixed(1)+'<span class="unit">°C</span></div></div>';
     html+='<div class="card"><div class="card-title">SoC</div><div class="big-num" style="color:'+tc(d.soc_max)+'">'+(d.soc_max||0).toFixed(1)+'<span class="unit">°C</span></div></div>';
@@ -972,12 +1058,33 @@ function renderDash(d) { /* 保持原有逻辑 */
     html+='<div class="card"><div class="card-title">屏幕</div><div style="font-size:10px">'+(d.screen_on?'<span style="color:#58a6ff">亮屏</span>':'<span style="color:#484f58">息屏</span>')+'</div></div>';
     html+='<div class="card"><div class="card-title">时间</div><div class="num-sm" style="color:#58a6ff">'+d.time+'</div></div>';
     html+='</div>';
-    html+='<div class="card" style="margin-bottom:8px"><div class="card-title">核心频率</div><div style="line-height:18px">'+coreBars+'</div></div>';
+    html+='<div class="card" style="margin-bottom:8px"><div class="card-title">核心频率</div><div id="core-bars" style="line-height:18px">'+coreBars+'</div></div>';
     html+='<div class="chart-card"><div class="chart-title">历史趋势</div><div class="row"><div class="col"><canvas id="chart_temp"></canvas></div><div class="col"><canvas id="chart_discharge"></canvas></div></div></div>';
-    html+='<div class="card" style="margin-bottom:6px"><div class="card-title">唤醒锁</div><div>'+wlTags+'</div></div>';
-    html+='<div class="row"><div class="col"><div class="table-card"><table width="100%"><tr><th>#</th><th>进程</th><th>线程</th><th>CPU%</th></tr>'+procRows+'</table></div></div>';
-    html+='<div class="col"><div class="table-card"><table width="100%"><tr><th>#</th><th>进程</th><th>内存%</th><th>RSS</th></tr>'+memProcRows+'</table></div></div></div>';
+    html+='<div class="card" style="margin-bottom:6px"><div class="card-title">唤醒锁</div><div id="wl-tags">'+wlTags+'</div></div>';
+    html+='<div class="row"><div class="col"><div class="table-card"><table width="100%"><tr><th>#</th><th>进程</th><th>线程</th><th>CPU%</th></tr><tbody id="proc-cpu-tbody">'+procRows+'</tbody></table></div></div>';
+    html+='<div class="col"><div class="table-card"><table width="100%"><tr><th>#</th><th>进程</th><th>内存%</th><th>RSS</th></tr><tbody id="proc-mem-tbody">'+memProcRows+'</tbody></table></div></div></div>';
     document.getElementById("dash").innerHTML = html;
+}
+
+function patchDash(d) {
+    const batPct = d.bat_level||0;
+    const batClr = batPct>50?"#4CAF50":batPct>20?"#FF9800":"#F44336";
+    const chgClr = d.charging?"#4CAF50":"#484f58";
+    const chgArrow = d.charging?"↑":(d.charge_status=="放电中"?"↓":"");
+    // 核心频率
+    let coreBars=""; (d.per_core_freqs||[]).forEach((f,i)=>{
+        let pct=Math.min(f/3000*100,100),clr=f>2000?"#F44336":f>1000?"#FF9800":"#4CAF50";
+        coreBars+='<span class="core-label">C'+i+'</span><span class="core-bar"><span class="core-bar-fill" style="width:'+pct+'%;background:'+clr+'"></span></span>';
+    });
+    let cb = document.getElementById("core-bars"); if(cb) cb.innerHTML = coreBars;
+    // 唤醒锁
+    let wlTags = ""; (d.wakelocks||[]).forEach(w=>{wlTags+='<span class="wl-tag">'+w+'</span>';});
+    if(!wlTags) wlTags='<span style="color:#484f58;font-size:8px">无</span>';
+    let wt = document.getElementById("wl-tags"); if(wt) wt.innerHTML = wlTags;
+    // 进程表
+    let [procRows, memProcRows] = buildProcRows(d.top_procs, d.top_mem_procs);
+    let cpuTbody = document.getElementById("proc-cpu-tbody"); if(cpuTbody) cpuTbody.innerHTML = procRows;
+    let memTbody = document.getElementById("proc-mem-tbody"); if(memTbody) memTbody.innerHTML = memProcRows;
 }
 
 function renderChargeChart() { /* 保持原有 */ }
@@ -1234,10 +1341,17 @@ function restartServer(){if(!confirm('确定要重启监控服务吗?'))return;f
 // ===== 主循环 =====
 let failCount=0;
 function load(){
+    fetch("/core").then(r=>r.json()).then(d=>{
+        failCount=0;
+        if(currentTab==='dashboard' && dashFirstPaint){renderDash(d);dashFirstPaint=false;}
+    }).catch(()=>{failCount++;if(failCount>=3)document.getElementById("dash").innerHTML="ADB连接失败，请检查手机连接";});
     fetch("/data").then(r=>r.json()).then(d=>{
-        failCount=0;history.push(d);if(history.length>MAX_HISTORY)history.shift();
+        history.push(d);if(history.length>MAX_HISTORY)history.shift();
         checkAlerts(d.top_procs);
-        if(currentTab==='dashboard')renderDash(d);
+        if(currentTab==='dashboard'){
+            if(dashFirstPaint){renderDash(d);dashFirstPaint=false;}
+            else patchDash(d);
+        }
         if(d.charging && !prevCharging)fetch('/charge/start?level='+d.bat_level,{method:'POST'}).catch(()=>{});
         prevCharging=d.charging;
         if(currentTab==='charge'){fetch('/charge/state').then(r=>r.json()).then(cs=>{chargePoints=cs.points||[];renderChargeChart();}).catch(()=>{});}
@@ -1247,7 +1361,7 @@ function load(){
             drawChart(history,'chart_temp','temp','#FF9800','温度',50);
             drawChart(history,'chart_discharge','discharge_ma','#FF9800','放电',Math.max(500,...history.map(d=>d.discharge_ma||0)));
         }
-    }).catch(()=>{failCount++;if(failCount>=3)document.getElementById("dash").innerHTML="ADB连接失败，请检查手机连接";});
+    });
 }
 load();setInterval(load,__INTERVAL__);
 </script>
@@ -1298,7 +1412,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
         parsed = urllib.parse.urlparse(self.path)
         qs = urllib.parse.parse_qs(parsed.query)
 
-        if parsed.path == "/data":
+        if parsed.path == "/core":
+            self._json(get_core_data())
+
+        elif parsed.path == "/data":
             data = get_data()
             update_mem_history(data.get("top_mem_procs",[]))
             update_battery_health()
