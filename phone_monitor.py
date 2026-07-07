@@ -515,19 +515,26 @@ def get_app_startup(pkg):
     # 先强杀
     subprocess.run([ADB,"shell","am","force-stop",pkg],capture_output=True,timeout=5)
     time.sleep(0.5)
-    raw = adb(["am","start","-W",f"{pkg}/.MainActivity"])
-    if not raw:
-        # 尝试获取 launcher activity
-        act_raw = adb(["cmd","package","resolve-activity","--brief",pkg,"|","tail","-n","1"])
-        if not act_raw:
-            # 用 monkey 获取
-            act_raw = adb(["monkey","-p",pkg,"-c","android.intent.category.LAUNCHER","1"])
-            for line in act_raw.split("\n"):
-                if "cmp=" in line:
-                    act_raw = line.split("cmp=")[1].split()[0]
-                    break
-        if act_raw:
-            raw = adb(["am","start","-W",act_raw])
+    # 解析 launcher activity
+    launcher = None
+    raw = adb(["cmd","package","resolve-activity","--brief","-c","android.intent.category.LAUNCHER",pkg])
+    if raw:
+        for line in raw.strip().split("\n"):
+            line = line.strip()
+            if "/" in line and line.startswith(pkg):
+                launcher = line
+                break
+    if not launcher:
+        # 备用: monkey 解析
+        raw = adb(["monkey","-p",pkg,"-c","android.intent.category.LAUNCHER","1"])
+        for line in (raw or "").split("\n"):
+            if "cmp=" in line:
+                launcher = line.split("cmp=")[1].split()[0]
+                break
+    if launcher:
+        raw = adb(["am","start","-W","-n",launcher])
+    else:
+        raw = ""
     result = {"pkg":pkg,"totalTime":0,"waitTime":0,"thisTime":0,"status":"ok"}
     for line in raw.split("\n"):
         if "TotalTime:" in line:
