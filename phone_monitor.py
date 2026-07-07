@@ -23,6 +23,15 @@ PORT = 9999
 REFRESH_INTERVAL = 2
 DATA_DIR = os.path.dirname(os.path.abspath(__file__))
 
+MODE_FILE = os.path.join(DATA_DIR, "mode.txt")
+try:
+    with open(MODE_FILE) as f: MODE = f.read().strip()
+    if MODE not in ("monitor", "test"): MODE = "monitor"
+except: MODE = "monitor"
+
+def save_mode():
+    with open(MODE_FILE, "w") as f: f.write(MODE)
+
 # ======================= 全局状态 =======================
 prev_stat = {}
 prev_stat_lock = threading.Lock()
@@ -109,7 +118,8 @@ def get_data():
     global prev_stat
     data = {"time": time.strftime("%H:%M:%S"), "timestamp": time.time()}
 
-    with ThreadPoolExecutor(max_workers=8) as ex:
+    workers = 1 if MODE == "monitor" else 8
+    with ThreadPoolExecutor(max_workers=workers) as ex:
         f_bat = ex.submit(adb, ["dumpsys", "battery"])
         f_batt_sys = ex.submit(adb, ["cat", "/sys/class/power_supply/battery/voltage_now",
             "/sys/class/power_supply/battery/current_now", "/sys/class/power_supply/battery/charge_type"])
@@ -265,7 +275,8 @@ def get_core_data():
     global prev_stat
     data = {"time": time.strftime("%H:%M:%S"), "timestamp": time.time()}
 
-    with ThreadPoolExecutor(max_workers=5) as ex:
+    workers = 1 if MODE == "monitor" else 5
+    with ThreadPoolExecutor(max_workers=workers) as ex:
         f_bat = ex.submit(adb, ["dumpsys", "battery"])
         f_batt_sys = ex.submit(adb, ["cat", "/sys/class/power_supply/battery/voltage_now",
             "/sys/class/power_supply/battery/current_now",
@@ -885,6 +896,8 @@ input[type="number"] { width: 70px; }
 <body>
 <h1>手机实时监控 v6
 <span style="flex:1"></span>
+<span id="modeLabel" style="font-size:10px;color:#8b949e;margin-right:8px"></span>
+<button class="btn" id="modeToggle" onclick="switchMode()" style="background:#2ea043">切换模式</button>
 <button class="btn" onclick="exportCSV()">CSV导出</button>
 <button class="btn" onclick="restartServer()">重启服务</button>
 </h1>
@@ -1395,13 +1408,44 @@ function exportCSV() {
 }
 function restartServer(){if(!confirm('确定要重启监控服务吗?'))return;fetch('/restart',{method:'POST'}).then(r=>r.json()).then(d=>{showToast(d.message||'重启中...','#58a6ff');setTimeout(()=>{location.reload();},3000);}).catch(()=>{showToast('重启失败','#F44336');});}
 
+function switchMode(){
+    let newMode = currentMode==='monitor'?'test':'monitor';
+    if(!confirm('切换到 "'+newMode+'" 模式？服务将重启。'))return;
+    fetch('/mode/switch?mode='+newMode).then(r=>r.json()).then(d=>{
+        showToast('已切换到 '+d.mode+' 模式，服务重启中...','#58a6ff');
+        setTimeout(()=>{location.reload();},3000);
+    }).catch(()=>{showToast('切换失败','#F44336');});
+}
+
+function updateModeUI(mode){
+    currentMode = mode;
+    let lbl = document.getElementById('modeLabel');
+    let btn = document.getElementById('modeToggle');
+    if(mode==='monitor'){
+        lbl.textContent = '监控模式';
+        btn.textContent = '切到测试模式';
+        btn.style.background = '#2ea043';
+    } else {
+        lbl.textContent = '测试模式';
+        btn.textContent = '切到监控模式';
+        btn.style.background = '#db6d00';
+    }
+}
+
+fetch('/mode/state').then(r=>r.json()).then(d=>updateModeUI(d.mode)).catch(()=>{});
+
 // ===== 主循环 =====
+let currentMode = 'monitor';
 let failCount=0;
 function load(){
-    fetch("/core").then(r=>r.json()).then(d=>{
-        failCount=0;
-        if(currentTab==='dashboard' && dashFirstPaint){renderDash(d);dashFirstPaint=false;}
-    }).catch(()=>{failCount++;if(failCount>=3)document.getElementById("dash").innerHTML="ADB连接失败，请检查手机连接";});
+    if(currentMode==='monitor'){
+        /* 监控模式：跳过 /core，只调 /data，减少 ADB 调用 */
+    } else {
+        fetch("/core").then(r=>r.json()).then(d=>{
+            failCount=0;
+            if(currentTab==='dashboard' && dashFirstPaint){renderDash(d);dashFirstPaint=false;}
+        }).catch(()=>{failCount++;if(failCount>=3)document.getElementById("dash").innerHTML="ADB连接失败，请检查手机连接";});
+    }
     fetch("/data").then(r=>r.json()).then(d=>{
         if(!d || typeof d !== 'object') return;
         history.push(d);if(history.length>MAX_HISTORY)history.shift();
@@ -1467,11 +1511,28 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self._wrap(self._do_GET)
 
     def _do_GET(self):
+        global MODE
         parsed = urllib.parse.urlparse(self.path)
         qs = urllib.parse.parse_qs(parsed.query)
 
         if parsed.path == "/core":
-            self._json(get_core_data())
+            if MODE == "monitor":
+                self._json({})  # 监控模式跳过 /core，节省 ADB 调用
+            else:
+                self._json(get_core_data())
+
+        elif parsed.path == "/mode/switch":
+            new_mode = qs.get("mode",[""])[0]
+            if new_mode in ("monitor", "test"):
+                MODE = new_mode
+                save_mode()
+                self._json({"mode": MODE})
+                do_restart()  # 响应后再重启
+            else:
+                self._json({"mode": MODE})
+
+        elif parsed.path == "/mode/state":
+            self._json({"mode": MODE})
 
         elif parsed.path == "/data":
             data = get_data()
