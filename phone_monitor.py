@@ -1111,7 +1111,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(json.dumps(data, ensure_ascii=False).encode())
 
+    def _wrap(self, method):
+        """包装请求处理，抑制连接中断异常"""
+        try:
+            method()
+        except (ConnectionAbortedError, ConnectionResetError, BrokenPipeError):
+            pass
+
     def do_GET(self):
+        self._wrap(self._do_GET)
+
+    def _do_GET(self):
         parsed = urllib.parse.urlparse(self.path)
         qs = urllib.parse.parse_qs(parsed.query)
 
@@ -1161,6 +1171,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.wfile.write(HTML.encode())
 
     def do_POST(self):
+        self._wrap(self._do_POST)
+
+    def _do_POST(self):
         parsed = urllib.parse.urlparse(self.path)
         qs = urllib.parse.parse_qs(parsed.query)
 
