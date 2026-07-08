@@ -1300,6 +1300,38 @@ input[type="number"] { width: 70px; }
 .monkey-running { background: #FF9800; color: #000; }
 .monkey-done { background: #4CAF50; color: #fff; }
 .hist-bar { display: inline-block; height: 14px; background: #58a6ff; border-radius: 2px; vertical-align: middle; margin-right: 4px; min-width: 2px; }
+@media (min-width: 2000px) {
+  body { font-size: 14px; }
+  h1 { font-size: 22px; }
+  .btn { font-size: 14px; padding: 5px 16px; }
+  .tab { font-size: 14px; padding: 7px 18px; }
+  .card-title { font-size: 12px; }
+  .big-num { font-size: 32px; }
+  .unit { font-size: 14px; }
+  .table-card th { font-size: 12px; padding: 6px 10px; }
+  .table-card td { font-size: 14px; padding: 5px 10px; }
+  .tag { font-size: 11px; padding: 2px 5px; }
+  .num-sm { font-size: 18px; }
+  .label { font-size: 12px; }
+  .wl-tag { font-size: 12px; padding: 2px 7px; }
+  .kill-btn { width: 18px; height: 18px; line-height: 17px; font-size: 12px; }
+  .toast { font-size: 14px; padding: 10px 18px; }
+  .core-label { font-size: 12px; width: 36px; }
+  .chart-title { font-size: 12px; }
+  .footer { font-size: 12px; }
+  .log-view { font-size: 14px; }
+  .process-name { max-width: 200px; }
+  input[type="text"], input[type="number"] { font-size: 13px; padding: 5px 10px; width: 220px; }
+  input[type="number"] { width: 90px; }
+  .add-btn { font-size: 13px; padding: 4px 12px; }
+  .remove-btn { font-size: 12px; }
+  .whitelist-item { font-size: 12px; padding: 3px 8px; }
+  .screenshot-preview { max-width: 400px; }
+  .monkey-status { font-size: 16px; }
+  .hist-bar { height: 20px; }
+  .bar-fill { height: 3px; }
+  .form-row { gap: 10px; margin-bottom: 10px; }
+}
 </style>
 </head>
 <body>
