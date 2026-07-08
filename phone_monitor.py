@@ -1080,6 +1080,21 @@ def get_gpu_info():
     return result
 
 
+def restart_adb():
+    """kill-server + start-server 重置ADB守护进程"""
+    subprocess.run([ADB, "kill-server"], capture_output=True, timeout=5)
+    time.sleep(0.5)
+    subprocess.run([ADB, "start-server"], capture_output=True, timeout=5)
+    # 等待设备重连
+    for i in range(30):
+        dev = subprocess.run([ADB, "devices"], capture_output=True, text=True, timeout=5)
+        lines = [l for l in dev.stdout.strip().split("\n") if l and "\tdevice" in l]
+        if lines:
+            return {"ok": True, "devices": len(lines), "detail": "\n".join(lines)}
+        time.sleep(1)
+    return {"ok": False, "devices": 0, "detail": "设备未重连，请检查USB连接"}
+
+
 # ======================= v6.5 结束 =======================
 
 
@@ -2404,6 +2419,15 @@ def main():
     subprocess.run([ADB, "kill-server"], capture_output=True, timeout=5)
     time.sleep(0.5)
     subprocess.run([ADB, "start-server"], capture_output=True, timeout=5)
+    # 等待设备重连（USB设备需要时间重新枚举）
+    for i in range(30):
+        r = subprocess.run([ADB, "devices"], capture_output=True, text=True, timeout=5)
+        if "\tdevice" in r.stdout:
+            print("设备已重连")
+            break
+        time.sleep(1)
+    else:
+        print("警告：等待设备超时，请检查USB连接")
     time.sleep(0.3)
 
     # 启动时清理僵尸进程
