@@ -1092,7 +1092,7 @@ def restart_adb():
         if lines:
             return {"ok": True, "devices": len(lines), "detail": "\n".join(lines)}
         time.sleep(1)
-    return {"ok": False, "devices": 0, "detail": "设备未重连，请检查USB连接"}
+    return {"ok": False, "devices": 0, "detail": "设备未重连，请拔插手机USB数据线后重试"}
 
 
 # ======================= v6.5 结束 =======================
@@ -2423,11 +2423,21 @@ def main():
     for i in range(30):
         r = subprocess.run([ADB, "devices"], capture_output=True, text=True, timeout=5)
         if "\tdevice" in r.stdout:
-            print("设备已重连")
+            print("设备已重连\n")
             break
         time.sleep(1)
     else:
-        print("警告：等待设备超时，请检查USB连接")
+        print("设备未自动重连，请拔插手机USB数据线后按回车继续...")
+        input()
+        # 再次等待重连
+        for i in range(15):
+            r = subprocess.run([ADB, "devices"], capture_output=True, text=True, timeout=5)
+            if "\tdevice" in r.stdout:
+                print("设备已重连\n")
+                break
+            time.sleep(1)
+        else:
+            print("警告：重试后仍未检测到设备，请检查USB连接及驱动\n")
     time.sleep(0.3)
 
     # 启动时清理僵尸进程
