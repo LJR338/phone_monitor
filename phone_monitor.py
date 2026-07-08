@@ -1244,7 +1244,7 @@ del "%~f0"
 '''
     fd, path = tempfile.mkstemp(suffix=".bat", prefix="monitor_restart_")
     with os.fdopen(fd, "w") as f: f.write(bat)
-    subprocess.Popen(["cmd", "/c", path], creationflags=subprocess.CREATE_NEW_CONSOLE | 0x00000008)
+    subprocess.Popen(["cmd", "/c", path], creationflags=subprocess.DETACHED_PROCESS)
 
 
 # ======================= HTML 模板 =======================
