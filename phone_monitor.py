@@ -1945,10 +1945,19 @@ function restartAdb(){let b=document.getElementById('btnAdb');b.disabled=true;b.
 
 function switchMode(){
     let newMode = currentMode==='monitor'?'test':'monitor';
-    if(!confirm('切换到 "'+newMode+'" 模式？服务将重启。'))return;
+    if(!confirm('切换到 "'+newMode+'" 模式？'))return;
     fetch('/mode/switch?mode='+newMode).then(r=>r.json()).then(d=>{
-        showToast('已切换到 '+d.mode+' 模式，服务重启中...','#58a6ff');
-        setTimeout(()=>{location.reload();},3000);
+        currentMode = d.mode;
+        document.getElementById('modeLabel').textContent = d.mode==='test'?'测试模式':'';
+        document.getElementById('modeToggle').textContent = d.mode==='test'?'切换回监控':'切换模式';
+        document.getElementById('modeToggle').style.background = d.mode==='test'?'#FF9800':'#2ea043';
+        let tabs = document.querySelectorAll('.tab.app');
+        tabs.forEach(t=>t.style.display = d.mode==='test'?'inline-block':'none');
+        if(d.mode==='monitor'){
+            let appTabActive = document.querySelector('.tab.app.active');
+            if(appTabActive){appTabActive.classList.remove('active'); switchTab('dashboard');}
+        }
+        showToast('已切换到 '+d.mode+' 模式','#4CAF50');
     }).catch(()=>{showToast('切换失败','#F44336');});
 }
 
