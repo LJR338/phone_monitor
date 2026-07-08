@@ -1894,6 +1894,7 @@ function exportCSV() {
     showToast('CSV已导出','#4CAF50');
 }
 function restartServer(){if(!confirm('确定要重启监控服务吗?'))return;fetch('/restart',{method:'POST'}).then(r=>r.json()).then(d=>{showToast(d.message||'重启中...','#58a6ff');setTimeout(()=>{location.reload();},3000);}).catch(()=>{showToast('重启失败','#F44336');});}
+function restartAdb(){let b=document.getElementById('btnAdb');b.disabled=true;b.textContent='重置中...';fetch('/adb/restart').then(r=>r.json()).then(d=>{b.disabled=false;b.textContent='重置ADB';if(d.ok){showToast('ADB已重置，'+d.devices+'台设备在线','#4CAF50');}else{showToast('ADB重置完成，但未检测到设备','#FF9800');}}).catch(()=>{b.disabled=false;b.textContent='重置ADB';showToast('ADB重置失败','#F44336');});}
 
 function switchMode(){
     let newMode = currentMode==='monitor'?'test':'monitor';
@@ -2226,6 +2227,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
         elif parsed.path == "/gpuinfo":
             self._json(get_gpu_info())
 
+        elif parsed.path == "/adb/restart":
+            self._json(restart_adb())
+
         elif parsed.path == "/monkey/history":
             with monkey_results_lock: self._json(list(monkey_results))
 
@@ -2363,6 +2367,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
 # ======================= Main =======================
 
 def main():
+    # 启动时清理僵尸ADB服务端
+    print("清理ADB残留...")
+    subprocess.run([ADB, "kill-server"], capture_output=True, timeout=5)
+    time.sleep(0.5)
+    subprocess.run([ADB, "start-server"], capture_output=True, timeout=5)
+    time.sleep(0.3)
+
     # 启动时清理僵尸进程
     if os.path.exists(PID_FILE):
         try:
