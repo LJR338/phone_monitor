@@ -2129,10 +2129,11 @@ function load(){
         fetch("/core").then(r=>r.json()).then(d=>{
             failCount=0;
             if(currentTab==='dashboard' && dashFirstPaint){renderDash(d);dashFirstPaint=false;}
-        }).catch(()=>{failCount++;if(failCount>=3)document.getElementById("dash").innerHTML="ADB连接失败，请检查手机连接";});
+        }).catch(()=>{failCount++;if(failCount>=3)document.getElementById("dash").innerHTML='ADB无响应，<a href="#" onclick="restartAdb()" style="color:#58a6ff">点击重置ADB</a> 或拔插USB数据线';});
     }
     fetch("/data").then(r=>r.json()).then(d=>{
         if(!d || typeof d !== 'object') return;
+        failCount=0;
         history.push(d);if(history.length>MAX_HISTORY)history.shift();
         checkAlerts(d.top_procs);
         if(currentTab==='dashboard'){
@@ -2148,7 +2149,7 @@ function load(){
             drawChart(history,'chart_temp','temp','#FF9800','温度',50);
             drawChart(history,'chart_discharge','discharge_ma','#FF9800','放电',Math.max(500,...history.map(d=>d.discharge_ma||0)));
         }
-    }).catch(()=>{failCount++;if(failCount>=3)document.getElementById("dash").innerHTML="ADB连接失败，请检查手机连接";});
+    }).catch(()=>{failCount++;if(failCount>=3)document.getElementById("dash").innerHTML='ADB无响应，<a href="#" onclick="restartAdb()" style="color:#58a6ff">点击重置ADB</a> 或拔插USB数据线';});
 }
 load();setInterval(load,__INTERVAL__);
 </script>
