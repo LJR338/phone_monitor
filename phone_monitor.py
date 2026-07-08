@@ -2414,24 +2414,6 @@ class Handler(http.server.BaseHTTPRequestHandler):
 # ======================= Main =======================
 
 def main():
-    # 启动时清理僵尸ADB服务端
-    print("清理ADB残留...")
-    subprocess.run([ADB, "kill-server"], capture_output=True, timeout=5)
-    time.sleep(0.5)
-    subprocess.run([ADB, "start-server"], capture_output=True, timeout=5)
-    # 等待设备重连（kill-server后USB链路需重新枚举）
-    print("请拔插手机USB数据线后按回车继续...")
-    input()
-    for i in range(15):
-        r = subprocess.run([ADB, "devices"], capture_output=True, text=True, timeout=5)
-        if "\tdevice" in r.stdout:
-            print("设备已重连\n")
-            break
-        time.sleep(1)
-    else:
-        print("警告：仍未检测到设备，请检查USB连接及驱动\n")
-    time.sleep(0.3)
-
     # 启动时清理僵尸进程
     if os.path.exists(PID_FILE):
         try:
