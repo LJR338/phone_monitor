@@ -1086,13 +1086,13 @@ def restart_adb():
     time.sleep(0.5)
     subprocess.run([ADB, "start-server"], capture_output=True, timeout=5)
     # 等待设备重连
-    for i in range(30):
+    for i in range(8):
         dev = subprocess.run([ADB, "devices"], capture_output=True, text=True, timeout=5)
         lines = [l for l in dev.stdout.strip().split("\n") if l and "\tdevice" in l]
         if lines:
             return {"ok": True, "devices": len(lines), "detail": "\n".join(lines)}
         time.sleep(1)
-    return {"ok": False, "devices": 0, "detail": "设备未重连，请拔插手机USB数据线后重试"}
+    return {"ok": False, "devices": 0, "detail": "设备未自动重连，请拔插手机USB数据线后重试"}
 
 
 # ======================= v6.5 结束 =======================
@@ -2419,8 +2419,8 @@ def main():
     subprocess.run([ADB, "kill-server"], capture_output=True, timeout=5)
     time.sleep(0.5)
     subprocess.run([ADB, "start-server"], capture_output=True, timeout=5)
-    # 等待设备重连（USB设备需要时间重新枚举）
-    for i in range(30):
+    # 等待设备重连（kill-server后USB链路需重新枚举）
+    for i in range(8):
         r = subprocess.run([ADB, "devices"], capture_output=True, text=True, timeout=5)
         if "\tdevice" in r.stdout:
             print("设备已重连\n")
@@ -2429,7 +2429,6 @@ def main():
     else:
         print("设备未自动重连，请拔插手机USB数据线后按回车继续...")
         input()
-        # 再次等待重连
         for i in range(15):
             r = subprocess.run([ADB, "devices"], capture_output=True, text=True, timeout=5)
             if "\tdevice" in r.stdout:
