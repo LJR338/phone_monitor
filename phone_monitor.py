@@ -91,8 +91,16 @@ def adb(cmd):
 
 def get_charge_full():
     val = adb(["cat", "/sys/class/power_supply/battery/charge_full"])
-    try: return int(val) // 1000
-    except: return 0
+    try:
+        cf = int(val) // 1000
+        if cf > 0: return cf
+    except: pass
+    # 无 root 时回退到 dumpsys batterystats 的学习容量
+    raw = adb(["dumpsys", "batterystats"])
+    for line in raw.split("\n"):
+        m = re.search(r'(?:Estimated|Last learned) battery capacity:\s*(\d+)', line)
+        if m: return int(m.group(1))
+    return 0
 
 
 def get_wakeup_sources():
@@ -1043,24 +1051,106 @@ def get_cpu_governor():
     return result
 
 
+# ======================= 性能模式控制 =======================
+
+PERF_MODE_COMMANDS = {
+    "performance": {
+        "power_performance": ["shell", "settings", "put", "system", "POWER_PERFORMANCE_MODE_OPEN", "1"],
+        "speed_mode": ["shell", "settings", "put", "system", "speed_mode", "1"],
+        "speed_mode_enable": ["shell", "settings", "put", "secure", "speed_mode_enable", "1"],
+        "dynamic_perf": ["shell", "settings", "put", "global", "DYNAMIC_PERFORMANCE_DEFAULT_STATUS", "1"],
+        "fixed_perf": ["shell", "cmd", "power", "set-fixed-performance-mode-enabled", "true"],
+    },
+    "battery": {
+        "power_performance": ["shell", "settings", "put", "system", "POWER_PERFORMANCE_MODE_OPEN", "0"],
+        "speed_mode": ["shell", "settings", "put", "system", "speed_mode", "0"],
+        "speed_mode_enable": ["shell", "settings", "put", "secure", "speed_mode_enable", "0"],
+        "dynamic_perf": ["shell", "settings", "put", "global", "DYNAMIC_PERFORMANCE_DEFAULT_STATUS", "0"],
+        "fixed_perf": ["shell", "cmd", "power", "set-fixed-performance-mode-enabled", "false"],
+    },
+}
+
+
+def set_perf_mode(mode, option):
+    """异步执行性能模式切换，立即返回"""
+    if mode == "default":
+        cmds = list(PERF_MODE_COMMANDS["battery"].items())
+    elif mode in ("performance", "battery"):
+        if option not in PERF_MODE_COMMANDS.get(mode, {}):
+            return {"success": False, "message": f"未知选项: {option}"}
+        cmds = [(option, PERF_MODE_COMMANDS[mode][option])]
+    else:
+        return {"success": False, "message": f"未知模式: {mode}"}
+
+    def _apply():
+        for opt_name, cmd_args in cmds:
+            adb(cmd_args)
+
+    threading.Thread(target=_apply, daemon=True).start()
+    return {"success": True, "message": f"已切换 {mode} 模式"}
+
+
+def get_perf_mode_status():
+    """读取性能相关 settings 键当前值"""
+    keys = {
+        "power_performance": ["shell", "settings", "get", "system", "POWER_PERFORMANCE_MODE_OPEN"],
+        "speed_mode": ["shell", "settings", "get", "system", "speed_mode"],
+        "speed_mode_enable": ["shell", "settings", "get", "secure", "speed_mode_enable"],
+        "dynamic_perf": ["shell", "settings", "get", "global", "DYNAMIC_PERFORMANCE_DEFAULT_STATUS"],
+        "fixed_perf": ["shell", "cmd", "power", "get-fixed-performance-mode-enabled"],
+    }
+    result = {}
+    for key, cmd_args in keys.items():
+        val = adb(cmd_args).strip()
+        # 处理布尔值输出
+        if val.lower() in ("true", "enabled"):
+            val = "1"
+        elif val.lower() in ("false", "disabled"):
+            val = "0"
+        elif val in ("null", ""):
+            val = "0"
+        result[key] = val
+    return result
+
+
 def get_gpu_info():
-    """GPU频率和负载 - sysfs kgsl"""
+    """GPU频率和负载 - sysfs kgsl / MIUI /sys/kernel/gpu"""
     result = {"gpu_model":"","gpu_freq_mhz":0,"gpu_busy_pct":0,"gpu_available":False}
-    # Adreno GPU (高通)
+
+    # --- 高通 Adreno GPU (sysfs kgsl) ---
     gpuclk = adb(["cat","/sys/class/kgsl/kgsl-3d0/gpuclk"])
-    if gpuclk:
-        result["gpu_available"] = True
+    if gpuclk and "Permission denied" not in gpuclk:
         try: result["gpu_freq_mhz"] = round(int(gpuclk.strip())/1000000,1)
         except: pass
+
     gpubusy = adb(["cat","/sys/class/kgsl/kgsl-3d0/gpubusy"])
-    if gpubusy:
+    kgsl_detected = False
+    if gpubusy and "Permission denied" not in gpubusy:
+        kgsl_detected = True
         parts = gpubusy.strip().split()
         if len(parts) == 2:
             try:
                 busy = int(parts[0]); total = int(parts[1])
                 result["gpu_busy_pct"] = round(busy/max(total,1)*100,1) if total>0 else 0
             except: pass
-    # Mali GPU (联发科/三星)
+
+    if kgsl_detected or (gpuclk and "Permission denied" not in gpuclk):
+        result["gpu_available"] = True
+
+    # --- MIUI /sys/kernel/gpu/ （小米设备无root时的兜底路径） ---
+    if not result["gpu_available"]:
+        gpuclk2 = adb(["cat","/sys/kernel/gpu/gpu_clock"])
+        if gpuclk2 and "Permission denied" not in gpuclk2:
+            result["gpu_available"] = True
+            try: result["gpu_freq_mhz"] = round(int(gpuclk2.strip())/1000000,1)
+            except: pass
+        gpubusy2 = adb(["cat","/sys/kernel/gpu/gpu_busy"])
+        if gpubusy2 and "Permission denied" not in gpubusy2:
+            result["gpu_available"] = True
+            try: result["gpu_busy_pct"] = int(gpubusy2.strip())
+            except: pass
+
+    # --- Mali GPU (联发科/三星) ---
     if not result["gpu_available"]:
         malifreq = adb(["cat","/sys/class/misc/mali0/device/devfreq/13000000.mali/cur_freq"])
         if malifreq:
@@ -1071,28 +1161,135 @@ def get_gpu_info():
         if maliutil:
             try: result["gpu_busy_pct"] = int(maliutil.strip())
             except: pass
-    # GPU型号
-    raw = adb(["cat","/proc/gpufreq/gpufreq_opp_dump"])
-    if not raw:
+
+    # --- GPU型号 ---
+    # 1) MIUI 路径
+    raw = adb(["cat","/sys/kernel/gpu/gpu_model"])
+    if raw: result["gpu_model"] = raw.strip()
+    # 2) 联发科路径
+    if not result["gpu_model"]:
+        raw = adb(["cat","/proc/gpufreq/gpufreq_opp_dump"])
+    # 3) dumpsys SurfaceFlinger
+    if not result["gpu_model"]:
         raw = adb(["dumpsys","SurfaceFlinger"])
         m = re.search(r'GLES:\s*(\S+)', raw)
         if m: result["gpu_model"] = m.group(1)
     return result
 
 
+# ======================= 系统设置优化 (耗电相关) =======================
+
+# 设置项 -> (命名空间, 控件类型, 中文标签)
+SYSOPT_SETTINGS = {
+    "wifi_scan_always_enabled": {"ns": "global", "type": "switch", "label": "WiFi 始终扫描"},
+    "doze_enabled": {"ns": "global", "type": "switch", "label": "深度休眠 (Doze)"},
+    "doze_always_on": {"ns": "global", "type": "switch", "label": "息屏常亮 (Doze Always On)"},
+    "location_mode": {"ns": "secure", "type": "select", "label": "定位模式",
+                      "options": [("1", "仅传感器"), ("2", "省电"), ("3", "高精度")]},
+    "speed_mode": {"ns": "system", "type": "switch", "label": "性能加速", "combo": ["speed_mode", "speed_mode_enable"]},
+    "DYNAMIC_PERFORMANCE_DEFAULT_STATUS": {"ns": "global", "type": "switch", "label": "动态高性能默认"},
+    "automatic_power_save_mode": {"ns": "global", "type": "switch", "label": "自动省电模式 (20%)"},
+    "restrict_background": {"ns": "global", "type": "switch", "label": "后台数据限制"},
+    "ble_scan_always_enabled": {"ns": "global", "type": "switch", "label": "蓝牙始终扫描"},
+    "mobile_data_always_on": {"ns": "global", "type": "switch", "label": "移动数据始终在线"},
+    "auto_sync": {"ns": "global", "type": "switch", "label": "自动同步"},
+    "wifi_suspend_optimizations_enabled": {"ns": "global", "type": "switch", "label": "WiFi 休眠优化"},
+}
+
+# 反向映射：设置项 -> 命名空间（供 set 接口使用）
+SYSOPT_NS = {k: v["ns"] for k, v in SYSOPT_SETTINGS.items()}
+
+# 一键省电映射表：(namespace, key, value)
+SYSOPT_ONESHOT_MAP = [
+    ("global", "wifi_scan_always_enabled", "0"),
+    ("global", "doze_enabled", "1"),
+    ("global", "doze_always_on", "1"),
+    ("secure", "location_mode", "1"),
+    ("system", "speed_mode", "0"),
+    ("secure", "speed_mode_enable", "0"),
+    ("global", "DYNAMIC_PERFORMANCE_DEFAULT_STATUS", "0"),
+    ("global", "automatic_power_save_mode", "1"),
+    ("global", "restrict_background", "1"),
+    ("global", "ble_scan_always_enabled", "0"),
+    ("global", "mobile_data_always_on", "0"),
+    ("global", "auto_sync", "0"),
+    ("global", "wifi_suspend_optimizations_enabled", "1"),
+]
+
+
+def get_sysopt_status():
+    """读取所有耗电相关设置项当前值"""
+    result = {}
+    for key, meta in SYSOPT_SETTINGS.items():
+        ns = meta["ns"]
+        val = adb(["settings", "get", ns, key]).strip()
+        # 归一化布尔值
+        if val.lower() in ("true",):
+            val = "1"
+        elif val.lower() in ("false", "null", ""):
+            val = "0"
+        result[key] = val
+    return result
+
+
+def set_sysopt_setting(setting, value):
+    """写入单个设置项；speed_mode 开关需同时写入 speed_mode(system) 与 speed_mode_enable(secure)"""
+    if setting not in SYSOPT_NS:
+        return {"success": False, "message": f"未知设置项: {setting}"}
+    # 归一化开关值
+    if str(value).lower() in ("true", "on", "1", "yes"):
+        value = "1"
+    elif str(value).lower() in ("false", "off", "0", "no"):
+        value = "0"
+
+    meta = SYSOPT_SETTINGS.get(setting, {})
+    targets = []
+    if "combo" in meta:
+        for k in meta["combo"]:
+            targets.append((SYSOPT_SETTINGS[k]["ns"], k, value))
+    else:
+        targets.append((SYSOPT_NS[setting], setting, value))
+
+    def _apply():
+        for ns, key, v in targets:
+            adb(["settings", "put", ns, key, v])
+
+    threading.Thread(target=_apply, daemon=True).start()
+    return {"success": True, "setting": setting, "value": value,
+            "wrote": [t[1] for t in targets]}
+
+
+def set_sysopt_oneshot():
+    """一键省电：批量写入所有13个耗电设置项为最优省电值"""
+    results = {}
+
+    def _apply():
+        for ns, key, val in SYSOPT_ONESHOT_MAP:
+            try:
+                out = adb(["settings", "put", ns, key, val])
+                results[key] = "ok"
+            except Exception as e:
+                results[key] = f"fail: {e}"
+
+    t = threading.Thread(target=_apply, daemon=True)
+    t.start()
+    t.join()  # 等待全部写入完成再返回
+    return {"success": True, "results": results}
+
+
 def restart_adb():
-    """kill-server + start-server 重置ADB守护进程"""
+    """重置ADB连接（kill-server + start-server）"""
     subprocess.run([ADB, "kill-server"], capture_output=True, timeout=5)
-    time.sleep(0.5)
+    time.sleep(1)
     subprocess.run([ADB, "start-server"], capture_output=True, timeout=5)
-    # 等待设备重连
+    time.sleep(1)
     for i in range(8):
         dev = subprocess.run([ADB, "devices"], capture_output=True, text=True, timeout=5)
         lines = [l for l in dev.stdout.strip().split("\n") if l and "\tdevice" in l]
         if lines:
             return {"ok": True, "devices": len(lines), "detail": "\n".join(lines)}
         time.sleep(1)
-    return {"ok": False, "devices": 0, "detail": "设备未自动重连，请拔插手机USB数据线后重试"}
+    return {"ok": False, "devices": 0, "detail": "未检测到设备，请确认手机 USB 调试已授权后重试"}
 
 
 # ======================= v6.5 结束 =======================
@@ -1257,14 +1454,14 @@ HTML_TPL = r"""<!DOCTYPE html>
 <title>手机实时监控 v6</title>
 <style>
 * { margin: 0; padding: 0; box-sizing: border-box; }
-body { background: #0d1117; color: #c9d1d9; font-family: 'Consolas','Microsoft YaHei',monospace; padding: 16px; }
-h1 { font-size: 15px; margin-bottom: 6px; color: #58a6ff; display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
-.btn { font-size: 9px; padding: 3px 10px; border: 1px solid #30363d; background: #21262d; color: #c9d1d9; border-radius: 4px; cursor: pointer; }
+body { font-size: 11px; background: #0d1117; color: #c9d1d9; font-family: 'Consolas','Microsoft YaHei',monospace; padding: 16px; }
+h1 { font-size: 18px; margin-bottom: 6px; color: #58a6ff; display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.btn { font-size: 11px; padding: 4px 12px; border: 1px solid #30363d; background: #21262d; color: #c9d1d9; border-radius: 4px; cursor: pointer; }
 .btn:hover { background: #30363d; }
 .btn-on { background: #2ea043; border-color: #2ea043; }
 .btn-off { background: #F44336; border-color: #F44336; }
 .tabs { display: flex; gap: 2px; margin-bottom: 10px; border-bottom: 1px solid #30363d; flex-wrap: wrap; }
-.tab { font-size: 9px; padding: 5px 12px; background: transparent; color: #8b949e; border: none; cursor: pointer; border-bottom: 2px solid transparent; }
+.tab { font-size: 11px; padding: 6px 14px; background: transparent; color: #8b949e; border: none; cursor: pointer; border-bottom: 2px solid transparent; }
 .tab:hover { color: #c9d1d9; }
 .tab.active { color: #58a6ff; border-bottom-color: #58a6ff; }
 .tab.app { color: #d2a8ff; }
@@ -1274,48 +1471,65 @@ h1 { font-size: 15px; margin-bottom: 6px; color: #58a6ff; display: flex; align-i
 .tab-content.active { display: block; }
 .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 6px; margin-bottom: 8px; }
 .card { background: #161b22; border: 1px solid #30363d; border-radius: 5px; padding: 7px 9px; margin-bottom: 8px; }
-.card-title { font-size: 8px; color: #8b949e; margin-bottom: 3px; text-transform: uppercase; letter-spacing: 0.5px; }
-.big-num { font-size: 22px; font-weight: bold; }
-.unit { font-size: 10px; color: #8b949e; }
+.card-title { font-size: 10px; color: #8b949e; margin-bottom: 3px; text-transform: uppercase; letter-spacing: 0.5px; }
+.big-num { font-size: 28px; font-weight: bold; }
+.unit { font-size: 12px; color: #8b949e; }
 .row { display: flex; gap: 8px; flex-wrap: wrap; }
 .col { flex: 1; min-width: 320px; }
 .table-card { background: #161b22; border: 1px solid #30363d; border-radius: 5px; overflow: hidden; margin-bottom: 6px; }
-.table-card th { background: #21262d; font-size: 8px; color: #8b949e; text-align: left; padding: 4px 7px; text-transform: uppercase; }
-.table-card td { padding: 3px 7px; font-size: 10px; border-top: 1px solid #21262d; }
+.table-card th { background: #21262d; font-size: 10px; color: #8b949e; text-align: left; padding: 4px 7px; text-transform: uppercase; }
+.table-card td { padding: 4px 8px; font-size: 12px; border-top: 1px solid #21262d; }
 .bar-bg { background: #21262d; height: 2px; border-radius: 1px; margin-top: 2px; }
 .bar-fill { height: 2px; border-radius: 1px; transition: width 1s; }
-.process-name { max-width: 140px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; display: inline-block; vertical-align: middle; }
-.tag { font-size: 7px; padding: 1px 3px; border-radius: 2px; margin-left: 2px; }
-.num-sm { font-size: 13px; font-weight: bold; }
-.label { font-size: 8px; color: #8b949e; }
-.wl-tag { display: inline-block; font-size: 8px; background: #21262d; padding: 1px 5px; border-radius: 3px; margin: 1px; max-width: 120px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.kill-btn { display: inline-block; width: 13px; height: 13px; line-height: 12px; text-align: center; background: #F44336; color: #fff; border-radius: 2px; cursor: pointer; font-size: 8px; margin-left: 2px; vertical-align: middle; opacity: 0.5; transition: opacity 0.15s; user-select: none; }
+.process-name { max-width: 160px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; display: inline-block; vertical-align: middle; }
+.tag { font-size: 9px; padding: 1px 3px; border-radius: 2px; margin-left: 2px; }
+.num-sm { font-size: 16px; font-weight: bold; }
+.label { font-size: 10px; color: #8b949e; }
+.wl-tag { display: inline-block; font-size: 10px; background: #21262d; padding: 1px 5px; border-radius: 3px; margin: 1px; max-width: 120px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.kill-btn { display: inline-block; width: 16px; height: 16px; line-height: 15px; text-align: center; background: #F44336; color: #fff; border-radius: 2px; cursor: pointer; font-size: 10px; margin-left: 2px; vertical-align: middle; opacity: 0.5; transition: opacity 0.15s; user-select: none; }
 .kill-btn:hover { opacity: 1; }
-.toast { position: fixed; top: 10px; right: 10px; padding: 7px 14px; border-radius: 5px; font-size: 10px; z-index: 999; display: none; max-width: 320px; }
+.cpugov-mhz { font-size: 10px; color: #8b949e; }
+.cpugov-hint { font-size: 10px; color: #8b949e; margin-top: 6px; }
+.perfmode-btn { font-size: 11px; padding: 5px 14px; border: 1px solid #30363d; background: #21262d; color: #c9d1d9; border-radius: 4px; cursor: pointer; margin-right: 4px; }
+.perfmode-btn.active { background: #2ea043; border-color: #2ea043; color: #fff; }
+.perfmode-chk { margin-right: 4px; vertical-align: middle; }
+.perfmode-label { font-size: 11px; color: #c9d1d9; margin-right: 12px; }
+.sysopt-row { display: flex; align-items: center; gap: 12px; padding: 8px 4px; border-bottom: 1px solid #21262d; }
+.sysopt-row:last-child { border-bottom: none; }
+.sysopt-label { flex: 1; font-size: 12px; color: #c9d1d9; }
+.sysopt-val { font-size: 10px; color: #8b949e; min-width: 70px; text-align: right; }
+.sysopt-select { background: #21262d; border: 1px solid #30363d; color: #c9d1d9; padding: 4px 8px; font-size: 11px; border-radius: 3px; font-family: inherit; }
+.sysopt-switch { position: relative; display: inline-block; width: 38px; height: 20px; }
+.sysopt-switch input { opacity: 0; width: 0; height: 0; }
+.sysopt-slider { position: absolute; cursor: pointer; top: 0; left: 0; right: 0; bottom: 0; background: #30363d; transition: .2s; border-radius: 20px; }
+.sysopt-slider:before { position: absolute; content: ""; height: 14px; width: 14px; left: 3px; bottom: 3px; background: #8b949e; transition: .2s; border-radius: 50%; }
+.sysopt-switch input:checked + .sysopt-slider { background: #2ea043; }
+.sysopt-switch input:checked + .sysopt-slider:before { transform: translateX(18px); background: #fff; }
+.toast { position: fixed; top: 10px; right: 10px; padding: 8px 16px; border-radius: 5px; font-size: 12px; z-index: 999; display: none; max-width: 320px; }
 .core-bar { display: inline-block; width: 60px; height: 10px; background: #21262d; border-radius: 2px; vertical-align: middle; margin: 1px 2px; position: relative; }
 .core-bar-fill { position: absolute; left: 0; top: 0; height: 100%; border-radius: 2px; }
-.core-label { display: inline-block; width: 24px; font-size: 8px; color: #8b949e; text-align: right; margin-right: 2px; }
+.core-label { display: inline-block; width: 28px; font-size: 10px; color: #8b949e; text-align: right; margin-right: 2px; }
 .chart-card { background: #161b22; border: 1px solid #30363d; border-radius: 5px; padding: 6px; margin-bottom: 8px; }
-.chart-title { font-size: 8px; color: #8b949e; margin-bottom: 3px; text-transform: uppercase; }
+.chart-title { font-size: 10px; color: #8b949e; margin-bottom: 3px; text-transform: uppercase; }
 canvas { display: block; width: 100%; }
-.footer { text-align: center; font-size: 8px; color: #484f58; margin-top: 10px; }
-.log-view { background: #0a0e14; border: 1px solid #30363d; border-radius: 5px; height: 400px; overflow-y: auto; padding: 8px; font-size: 10px; font-family: 'Consolas', monospace; line-height: 1.4; }
+.footer { text-align: center; font-size: 10px; color: #484f58; margin-top: 10px; }
+.log-view { background: #0a0e14; border: 1px solid #30363d; border-radius: 5px; height: 400px; overflow-y: auto; padding: 8px; font-size: 12px; font-family: 'Consolas', monospace; line-height: 1.4; }
 .log-line { white-space: nowrap; }
 .log-V { color: #8b949e; } .log-D { color: #58a6ff; } .log-I { color: #4CAF50; }
 .log-W { color: #FF9800; } .log-E { color: #F44336; } .log-F { color: #F44336; font-weight: bold; }
 .log-time { color: #484f58; margin-right: 6px; }
-input[type="text"], input[type="number"] { background: #21262d; border: 1px solid #30363d; color: #c9d1d9; padding: 3px 6px; font-size: 9px; border-radius: 3px; font-family: inherit; width: 160px; }
+input[type="text"], input[type="number"] { background: #21262d; border: 1px solid #30363d; color: #c9d1d9; padding: 4px 8px; font-size: 11px; border-radius: 3px; font-family: inherit; width: 160px; }
 input[type="number"] { width: 70px; }
-.add-btn { font-size: 9px; padding: 2px 8px; background: #2ea043; border: none; color: #fff; border-radius: 3px; cursor: pointer; }
-.remove-btn { font-size: 8px; color: #F44336; cursor: pointer; margin-left: 6px; }
-.whitelist-item { display: inline-block; font-size: 8px; background: #21262d; padding: 2px 6px; border-radius: 3px; margin: 2px; }
-.screenshot-preview { max-width: 280px; border: 1px solid #30363d; border-radius: 3px; cursor: pointer; }
+.add-btn { font-size: 11px; padding: 3px 10px; background: #2ea043; border: none; color: #fff; border-radius: 3px; cursor: pointer; }
+.remove-btn { font-size: 10px; color: #F44336; cursor: pointer; margin-left: 6px; }
+.whitelist-item { display: inline-block; font-size: 10px; background: #21262d; padding: 2px 6px; border-radius: 3px; margin: 2px; }
+.screenshot-preview { max-width: 320px; border: 1px solid #30363d; border-radius: 3px; cursor: pointer; }
 .form-row { display: flex; align-items: center; gap: 6px; margin-bottom: 6px; flex-wrap: wrap; }
-.monkey-status { font-size: 12px; padding: 5px 12px; border-radius: 4px; display: inline-block; }
+.monkey-status { font-size: 14px; padding: 6px 14px; border-radius: 4px; display: inline-block; }
 .monkey-running { background: #FF9800; color: #000; }
 .monkey-done { background: #4CAF50; color: #fff; }
-.hist-bar { display: inline-block; height: 14px; background: #58a6ff; border-radius: 2px; vertical-align: middle; margin-right: 4px; min-width: 2px; }
-@media (min-width: 2000px) {
+.hist-bar { display: inline-block; height: 18px; background: #58a6ff; border-radius: 2px; vertical-align: middle; margin-right: 4px; min-width: 2px; }
+@media (min-resolution: 1.5dppx), (min-width: 2000px) {
   body { font-size: 14px; }
   h1 { font-size: 22px; }
   .btn { font-size: 14px; padding: 5px 16px; }
@@ -1330,6 +1544,10 @@ input[type="number"] { width: 70px; }
   .label { font-size: 12px; }
   .wl-tag { font-size: 12px; padding: 2px 7px; }
   .kill-btn { width: 18px; height: 18px; line-height: 17px; font-size: 12px; }
+  .cpugov-mhz { font-size: 12px; }
+  .cpugov-hint { font-size: 12px; }
+  .perfmode-btn { font-size: 13px; padding: 6px 16px; }
+  .perfmode-label { font-size: 13px; }
   .toast { font-size: 14px; padding: 10px 18px; }
   .core-label { font-size: 12px; width: 36px; }
   .chart-title { font-size: 12px; }
@@ -1356,6 +1574,8 @@ input[type="number"] { width: 70px; }
 <button class="btn" id="modeToggle" onclick="switchMode()" style="background:#2ea043">切换模式</button>
 <button class="btn" onclick="exportCSV()">CSV导出</button>
 <button class="btn" onclick="restartServer()">重启服务</button>
+<button class="btn" id="btnAdb" onclick="restartAdb()">重置ADB</button>
+<span id="adbStatus" style="font-size:10px;color:#FF9800;display:none"></span>
 </h1>
 <div class="tabs">
 <button class="tab active" onclick="switchTab('dashboard')">仪表盘</button>
@@ -1378,6 +1598,7 @@ input[type="number"] { width: 70px; }
 <button class="tab app" onclick="switchTab('iostat')">IO性能</button>
 <button class="tab app" onclick="switchTab('doze')">Doze检测</button>
 <button class="tab app" onclick="switchTab('cpugov')">CPU调度</button>
+<button class="tab app" onclick="switchTab('sysopt')">系统设置优化</button>
 <button class="tab app" onclick="switchTab('gpuinfo')">GPU频率</button>
 </div>
 
@@ -1513,11 +1734,40 @@ input[type="number"] { width: 70px; }
 </div>
 
 <div id="tab-cpugov" class="tab-content">
-<div class="card"><div class="card-title">CPU 调度详情 (/sys/devices/system/cpu/)</div>
+<div class="card"><div class="card-title">性能模式控制</div>
+<div class="form-row" style="margin-bottom:8px">
+<button class="perfmode-btn active" id="pmPerf" onclick="setPerfMode('performance')">性能模式</button>
+<button class="perfmode-btn" id="pmBatt" onclick="setPerfMode('battery')">省电模式</button>
+<button class="perfmode-btn" id="pmDef" onclick="setPerfMode('default')">恢复默认</button>
+</div>
+<div class="form-row" style="margin-bottom:6px">
+<label class="perfmode-label"><input type="checkbox" class="perfmode-chk" id="chkPowerPerf"> 性能模式开关</label>
+<label class="perfmode-label"><input type="checkbox" class="perfmode-chk" id="chkSpeedMode"> 加速模式</label>
+<label class="perfmode-label"><input type="checkbox" class="perfmode-chk" id="chkSpeedModeEnable"> 加速模式启用</label>
+<label class="perfmode-label"><input type="checkbox" class="perfmode-chk" id="chkDynamicPerf"> 动态性能</label>
+<label class="perfmode-label"><input type="checkbox" class="perfmode-chk" id="chkFixedPerf"> 固定性能模式</label>
+</div>
+<div id="perfmodeMsg" style="margin-bottom:8px"></div>
+</div>
+
+<div class="card"><div class="card-title">CPU 调度状态（只读）</div>
 <div class="form-row">
-<button class="btn add-btn" onclick="queryCpuGov()">查询CPU调度</button>
+<button class="btn add-btn" onclick="queryCpuGov()">刷新状态</button>
 </div>
 <div id="cpugovResult"></div>
+</div>
+</div>
+
+<div id="tab-sysopt" class="tab-content">
+<div class="card"><div class="card-title">系统设置优化 — 耗电相关</div>
+<div class="form-row">
+<button class="btn add-btn" onclick="loadSysoptStatus()">刷新状态</button>
+<button class="btn add-btn" id="oneshotBtn" onclick="oneshotSysopt()" style="background:#2ea043;border-color:#2ea043;color:#fff;">⚡ 一键省电</button>
+<span id="sysoptMsg" style="font-size:10px;color:#8b949e;margin-left:8px"></span>
+</div>
+<div id="sysoptItems" style="margin-top:8px">
+<span style="color:#8b949e">点击"刷新状态"加载...</span>
+</div>
 </div>
 </div>
 
@@ -1567,6 +1817,8 @@ function switchTab(name) {
     if (name === 'powersave') loadPowerSave();
     if (name === 'traffic') queryTraffic();
     if (name === 'monkey') loadMonkeyHistory();
+    if (name === 'cpugov') { queryCpuGov(); loadPerfModeStatus(); }
+    if (name === 'sysopt') { loadSysoptStatus(); }
 }
 
 function killProcess(pkg, el) {
@@ -1684,7 +1936,92 @@ function patchDash(d) {
     let memTbody = document.getElementById("proc-mem-tbody"); if(memTbody) memTbody.innerHTML = memProcRows;
 }
 
-function renderChargeChart() { /* 保持原有 */ }
+function renderChargeChart() {
+    let el = document.getElementById('charge');
+    let pts = chargePoints || [];
+    if (pts.length === 0) {
+        el.innerHTML = '<div style="color:#8b949e;text-align:center;padding:60px 0">暂无充电数据，请连接充电器后查看</div>';
+        return;
+    }
+    // 统计摘要
+    let first = pts[0], last = pts[pts.length - 1];
+    let durSec = last.time - first.time;
+    let durStr = durSec < 60 ? Math.round(durSec) + 's'
+        : durSec < 3600 ? Math.floor(durSec / 60) + 'm' + Math.round(durSec % 60) + 's'
+        : Math.floor(durSec / 3600) + 'h' + Math.floor((durSec % 3600) / 60) + 'm';
+    let levelDelta = last.level - first.level;
+    let avgPower = 0;
+    for (let p of pts) avgPower += p.power || 0;
+    avgPower = (avgPower / pts.length).toFixed(1);
+
+    let html = '<div class="charge-summary" style="display:flex;gap:24px;margin-bottom:16px;flex-wrap:wrap;color:#c9d1d9;font-size:14px">';
+    html += '<div>开始电量: <b>' + first.level + '%</b></div>';
+    html += '<div>当前电量: <b style="color:' + pc(last.level) + '">' + last.level + '%</b></div>';
+    html += '<div>已充电量: <b style="color:#58a6ff">+' + levelDelta + '%</b></div>';
+    html += '<div>耗时: <b>' + durStr + '</b></div>';
+    html += '<div>平均功率: <b>' + avgPower + 'W</b></div>';
+    html += '<div>当前温度: <b style="color:' + tc(last.temp) + '">' + (last.temp || 0).toFixed(1) + '°C</b></div>';
+    html += '<div>采样点: <b>' + pts.length + '</b></div>';
+    html += '</div>';
+
+    // 电量曲线图
+    html += '<div style="margin-bottom:8px;color:#8b949e;font-size:12px">电量曲线</div>';
+    html += '<canvas id="charge-level-canvas" style="width:100%;height:90px;border-radius:6px"></canvas>';
+    // 温度曲线图
+    html += '<div style="margin-top:16px;margin-bottom:8px;color:#8b949e;font-size:12px">温度曲线</div>';
+    html += '<canvas id="charge-temp-canvas" style="width:100%;height:90px;border-radius:6px"></canvas>';
+
+    el.innerHTML = html;
+
+    // 绘制电量曲线
+    let cl = document.getElementById('charge-level-canvas');
+    if (cl) {
+        let ctx = cl.getContext('2d'), W = Math.max(cl.parentElement.clientWidth, 200), H = 90;
+        cl.width = W * 2; cl.height = H * 2; cl.style.width = W + 'px'; cl.style.height = H + 'px';
+        ctx.scale(2, 2);
+        ctx.fillStyle = '#161b22'; ctx.fillRect(0, 0, W, H);
+        if (pts.length >= 2) {
+            let step = W / (pts.length - 1);
+            // 网格
+            ctx.strokeStyle = '#21262d'; ctx.lineWidth = 0.5;
+            for (let i = 0; i <= 4; i++) { let y = 8 + (H - 16) * i / 4; ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(W, y); ctx.stroke(); }
+            // 电量线
+            ctx.strokeStyle = '#58a6ff'; ctx.lineWidth = 2; ctx.beginPath();
+            for (let i = 0; i < pts.length; i++) {
+                let x = i * step, y = 8 + (H - 16) * (1 - (pts[i].level || 0) / 100);
+                if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+            }
+            ctx.stroke();
+            // 当前值标签
+            ctx.fillStyle = '#58a6ff'; ctx.font = 'bold 11px sans-serif';
+            ctx.fillText(last.level + '%', W - 36, 14);
+        }
+    }
+
+    // 绘制温度曲线
+    let ct = document.getElementById('charge-temp-canvas');
+    if (ct) {
+        let ctx = ct.getContext('2d'), W = Math.max(ct.parentElement.clientWidth, 200), H = 90;
+        ct.width = W * 2; ct.height = H * 2; ct.style.width = W + 'px'; ct.style.height = H + 'px';
+        ctx.scale(2, 2);
+        ctx.fillStyle = '#161b22'; ctx.fillRect(0, 0, W, H);
+        if (pts.length >= 2) {
+            let temps = pts.map(p => p.temp || 0);
+            let tMax = Math.max(45, Math.ceil(Math.max(...temps) / 5) * 5);
+            let step = W / (pts.length - 1);
+            ctx.strokeStyle = '#21262d'; ctx.lineWidth = 0.5;
+            for (let i = 0; i <= 4; i++) { let y = 8 + (H - 16) * i / 4; ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(W, y); ctx.stroke(); }
+            ctx.strokeStyle = '#f0883e'; ctx.lineWidth = 2; ctx.beginPath();
+            for (let i = 0; i < pts.length; i++) {
+                let x = i * step, y = 8 + (H - 16) * (1 - (pts[i].temp || 0) / tMax);
+                if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+            }
+            ctx.stroke();
+            ctx.fillStyle = '#f0883e'; ctx.font = 'bold 11px sans-serif';
+            ctx.fillText((last.temp || 0).toFixed(1) + '°C', W - 50, 14);
+        }
+    }
+}
 
 // ===== v5 标签页函数 =====
 function loadWakeup() {
@@ -1941,7 +2278,7 @@ function exportCSV() {
     showToast('CSV已导出','#4CAF50');
 }
 function restartServer(){if(!confirm('确定要重启监控服务吗?'))return;fetch('/restart',{method:'POST'}).then(r=>r.json()).then(d=>{showToast(d.message||'重启中...','#58a6ff');setTimeout(()=>{location.reload();},3000);}).catch(()=>{showToast('重启失败','#F44336');});}
-function restartAdb(){let b=document.getElementById('btnAdb');b.disabled=true;b.textContent='重置中...';fetch('/adb/restart').then(r=>r.json()).then(d=>{b.disabled=false;b.textContent='重置ADB';if(d.ok){showToast('ADB已重置，'+d.devices+'台设备在线','#4CAF50');}else{showToast('ADB重置完成，但未检测到设备','#FF9800');}}).catch(()=>{b.disabled=false;b.textContent='重置ADB';showToast('ADB重置失败','#F44336');});}
+function restartAdb(){let b=document.getElementById('btnAdb');let s=document.getElementById('adbStatus');s.style.display='none';b.disabled=true;b.textContent='重置中...';fetch('/adb/restart').then(r=>r.json()).then(d=>{b.disabled=false;b.textContent='重置ADB';if(d.ok){s.textContent=d.devices+'台设备在线';s.style.color='#4CAF50';s.style.display='inline';setTimeout(()=>{s.style.display='none';},3000);}else{s.textContent='未检测到设备，请在手机上重新授权USB调试后重试';s.style.color='#FF9800';s.style.display='inline';}}).catch(()=>{b.disabled=false;b.textContent='重置ADB';s.textContent='ADB重置失败，请在手机上重新授权USB调试后重试';s.style.color='#F44336';s.style.display='inline';});}
 
 function switchMode(){
     let newMode = currentMode==='monitor'?'test':'monitor';
@@ -2103,16 +2440,64 @@ function queryCpuGov() {
     fetch('/cpugov').then(r=>r.json()).then(d=>{
         let html='<div class="grid" style="margin-top:6px"><div class="card"><div class="card-title">核心数</div><div class="big-num">'+d.total_cores+'</div></div></div>';
         if(d.cores && d.cores.length>0){
-            html+='<div class="table-card"><table style="width:100%"><tr><th>核心</th><th style="text-align:center">Governor</th><th style="text-align:right">当前频率</th><th style="text-align:right">最小</th><th style="text-align:right">最大</th></tr>';
+            html+='<div class="table-card"><table style="width:100%"><tr><th>核心</th><th style="text-align:center;width:120px">Governor</th><th style="text-align:right">当前</th><th style="text-align:right;width:90px">最小 MHz</th><th style="text-align:right;width:90px">最大 MHz</th></tr>';
             d.cores.forEach(c=>{
                 let pct = c.max_mhz>0?((c.freq_mhz/c.max_mhz)*100).toFixed(0):0;
                 let clr = pct>80?'#F44336':pct>40?'#FF9800':'#4CAF50';
-                html+='<tr><td>CPU'+c.id+'</td><td style="text-align:center;font-size:9px">'+c.governor+'</td><td style="text-align:right;color:'+clr+';font-weight:bold">'+c.freq_mhz+'<span style="font-size:8px;color:#8b949e"> MHz</span></td><td style="text-align:right">'+c.min_mhz+'</td><td style="text-align:right">'+c.max_mhz+'</td></tr>';
+                html+='<tr><td style="font-weight:bold">CPU'+c.id+'</td>';
+                html+='<td style="text-align:center">'+c.governor+'</td>';
+                html+='<td style="text-align:right;color:'+clr+';font-weight:bold">'+c.freq_mhz+'<span class="cpugov-mhz"> MHz</span></td>';
+                html+='<td style="text-align:right">'+c.min_mhz+'</td>';
+                html+='<td style="text-align:right">'+c.max_mhz+'</td>';
+                html+='</tr>';
             });
             html+='</table></div>';
+            html+='<div class="cpugov-hint">以上为只读监控数据，来自 sysfs。性能模式切换请使用上方"性能模式控制"区域。</div>';
         }
         document.getElementById('cpugovResult').innerHTML = html;
     }).catch(()=>{document.getElementById('cpugovResult').innerHTML='<span style="color:#F44336">ADB连接失败</span>';});
+}
+
+function setPerfMode(mode) {
+    let optionMap = {
+        'power_performance': document.getElementById('chkPowerPerf').checked,
+        'speed_mode': document.getElementById('chkSpeedMode').checked,
+        'speed_mode_enable': document.getElementById('chkSpeedModeEnable').checked,
+        'dynamic_perf': document.getElementById('chkDynamicPerf').checked,
+        'fixed_perf': document.getElementById('chkFixedPerf').checked
+    };
+    let selected = Object.keys(optionMap).filter(k=>optionMap[k]);
+    if(selected.length === 0) {
+        document.getElementById('perfmodeMsg').innerHTML = '<span style="color:#FF9800">请至少勾选一个性能选项</span>';
+        return;
+    }
+    document.getElementById('perfmodeMsg').innerHTML = '<span style="color:#FF9800">正在切换性能模式...</span>';
+    let done = 0, failed = 0, msgs = [];
+    selected.forEach(opt=>{
+        fetch('/perfmode/set?mode='+encodeURIComponent(mode)+'&option='+encodeURIComponent(opt), {method:'POST'})
+            .then(r=>r.json()).then(d=>{
+                if(d.success) done++; else { failed++; msgs.push(opt+': '+d.message); }
+            })
+            .catch(()=>{ failed++; msgs.push(opt+': 请求失败'); })
+            .finally(()=>{
+                if(++done + failed >= selected.length) {
+                    let color = failed===0?'#4CAF50':'#F44336';
+                    let txt = '已应用 '+done+' 项' + (failed>0?('，失败 '+failed+' 项: '+msgs.join('; ')):'');
+                    document.getElementById('perfmodeMsg').innerHTML = '<span style="color:'+color+'">'+txt+'</span>';
+                    setTimeout(loadPerfModeStatus, 600);
+                }
+            });
+    });
+}
+
+function loadPerfModeStatus() {
+    fetch('/perfmode/status').then(r=>r.json()).then(d=>{
+        document.getElementById('chkPowerPerf').checked = d.power_performance === '1';
+        document.getElementById('chkSpeedMode').checked = d.speed_mode === '1';
+        document.getElementById('chkSpeedModeEnable').checked = d.speed_mode_enable === '1';
+        document.getElementById('chkDynamicPerf').checked = d.dynamic_perf === '1';
+        document.getElementById('chkFixedPerf').checked = d.fixed_perf === '1';
+    }).catch(()=>{});
 }
 
 function queryGpuInfo() {
@@ -2128,9 +2513,113 @@ function queryGpuInfo() {
     }).catch(()=>{document.getElementById('gpuinfoResult').innerHTML='<span style="color:#F44336">ADB连接失败</span>';});
 }
 
+// ===== 系统设置优化 =====
+function buildSysoptRow(key, meta, val) {
+    let label = meta.label || key;
+    let row = '<div class="sysopt-row">';
+    row += '<span class="sysopt-label">' + label + '</span>';
+    if (meta.type === 'switch') {
+        let checked = (val === '1' || val === 'true') ? ' checked' : '';
+        row += '<label class="sysopt-switch"><input type="checkbox" class="sysopt-chk" data-key="' + key + '"' + checked + ' onchange="setSysopt(\'' + key + '\', this.checked)"><span class="sysopt-slider"></span></label>';
+    } else if (meta.type === 'select') {
+        row += '<select class="sysopt-select" data-key="' + key + '" onchange="setSysopt(\'' + key + '\', this.value)">';
+        (meta.options || []).forEach(function(opt) {
+            let sel = (val === opt[0]) ? ' selected' : '';
+            row += '<option value="' + opt[0] + '"' + sel + '>' + opt[1] + '</option>';
+        });
+        row += '</select>';
+    }
+    row += '<span class="sysopt-val">当前: ' + val + '</span>';
+    row += '</div>';
+    return row;
+}
+
+function loadSysoptStatus() {
+    document.getElementById('sysoptMsg').innerHTML = '<span style="color:#FF9800">加载中...</span>';
+    fetch('/sysopt/status').then(r=>r.json()).then(d=>{
+        let defs = {"wifi_scan_always_enabled":{"type":"switch","label":"WiFi 始终扫描","ns":"global"},
+        "doze_enabled":{"type":"switch","label":"深度休眠 (Doze)","ns":"global"},
+        "doze_always_on":{"type":"switch","label":"息屏常亮 (Doze Always On)","ns":"global"},
+        "location_mode":{"type":"select","label":"定位模式","ns":"secure","options":[["1","仅传感器"],["2","省电"],["3","高精度"]]},
+        "speed_mode":{"type":"switch","label":"性能加速","ns":"system","combo":["speed_mode","speed_mode_enable"]},
+        "DYNAMIC_PERFORMANCE_DEFAULT_STATUS":{"type":"switch","label":"动态高性能默认","ns":"global"},
+        "automatic_power_save_mode":{"type":"switch","label":"自动省电模式 (20%)","ns":"global"},
+        "restrict_background":{"type":"switch","label":"后台数据限制","ns":"global"},
+        "ble_scan_always_enabled":{"type":"switch","label":"蓝牙始终扫描","ns":"global"},
+        "mobile_data_always_on":{"type":"switch","label":"移动数据始终在线","ns":"global"},
+        "auto_sync":{"type":"switch","label":"自动同步","ns":"global"},
+        "wifi_suspend_optimizations_enabled":{"type":"switch","label":"WiFi 休眠优化","ns":"global"}};
+        let html = '';
+        for (let k in defs) {
+            html += buildSysoptRow(k, defs[k], d[k] || '0');
+        }
+        document.getElementById('sysoptItems').innerHTML = html;
+        document.getElementById('sysoptMsg').innerHTML = '<span style="color:#4CAF50">已加载</span>';
+        setTimeout(function(){ document.getElementById('sysoptMsg').innerHTML = ''; }, 1500);
+    }).catch(function(){
+        document.getElementById('sysoptMsg').innerHTML = '<span style="color:#F44336">ADB连接失败</span>';
+    });
+}
+
+function setSysopt(setting, value) {
+    let val = value === true ? '1' : (value === false ? '0' : value);
+    document.getElementById('sysoptMsg').innerHTML = '<span style="color:#FF9800">写入中...</span>';
+    fetch('/sysopt/set', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({setting: setting, value: val})
+    }).then(r=>r.json()).then(d=>{
+        if (d.success) {
+            document.getElementById('sysoptMsg').innerHTML = '<span style="color:#4CAF50">已设置: ' + (d.wrote||[setting]).join(', ') + '=' + d.value + '</span>';
+            // 更新当前值显示
+            let rows = document.querySelectorAll('.sysopt-chk[data-key="' + setting + '"], .sysopt-select[data-key="' + setting + '"]');
+            rows.forEach(function(el) {
+                let vr = el.parentElement.parentElement.querySelector('.sysopt-val');
+                if (vr) vr.textContent = '当前: ' + d.value;
+            });
+        } else {
+            document.getElementById('sysoptMsg').innerHTML = '<span style="color:#F44336">失败: ' + (d.message || '未知错误') + '</span>';
+        }
+        setTimeout(function(){ document.getElementById('sysoptMsg').innerHTML = ''; }, 2000);
+    }).catch(function(){
+        document.getElementById('sysoptMsg').innerHTML = '<span style="color:#F44336">请求失败</span>';
+    });
+}
+
+function oneshotSysopt() {
+    let btn = document.getElementById('oneshotBtn');
+    btn.disabled = true;
+    btn.textContent = '执行中...';
+    document.getElementById('sysoptMsg').innerHTML = '<span style="color:#FF9800">正在批量写入省电设置...</span>';
+    fetch('/sysopt/oneshot', { method: 'POST' })
+    .then(r => r.json())
+    .then(d => {
+        if (d.success) {
+            let okCount = 0, failCount = 0;
+            for (let k in d.results) {
+                if (d.results[k] === 'ok') okCount++; else failCount++;
+            }
+            document.getElementById('sysoptMsg').innerHTML = '<span style="color:#4CAF50">一键省电完成: ' + okCount + ' 成功' + (failCount > 0 ? ', ' + failCount + ' 失败' : '') + '</span>';
+        } else {
+            document.getElementById('sysoptMsg').innerHTML = '<span style="color:#F44336">一键省电失败</span>';
+        }
+        btn.disabled = false;
+        btn.textContent = '⚡ 一键省电';
+        setTimeout(function(){ document.getElementById('sysoptMsg').innerHTML = ''; }, 3000);
+        // 自动刷新面板
+        loadSysoptStatus();
+    })
+    .catch(function(){
+        document.getElementById('sysoptMsg').innerHTML = '<span style="color:#F44336">请求失败</span>';
+        btn.disabled = false;
+        btn.textContent = '⚡ 一键省电';
+    });
+}
+
 // ===== 主循环 =====
 let currentMode = 'monitor';
-let failCount=0;
+let failCount=0,noDataCount=0;
+function showNoData(){document.getElementById("dash").innerHTML='<div style="text-align:center;padding:60px 20px;color:#8b949e"><div style="font-size:48px;margin-bottom:16px">&#9888;</div><div style="font-size:14px;margin-bottom:12px">未检测到手机数据</div><div style="font-size:11px">请确认USB已连接，然后 <a href="#" onclick="restartAdb()" style="color:#58a6ff">重连ADB</a> 或拔插USB数据线</div></div>';}
 function load(){
     if(currentMode==='monitor'){
         /* 监控模式：跳过 /core，只调 /data，减少 ADB 调用 */
@@ -2142,7 +2631,11 @@ function load(){
     }
     fetch("/data").then(r=>r.json()).then(d=>{
         if(!d || typeof d !== 'object') return;
+        let isEmpty=!(d.temp||d.soc_max||d.bat_level||d.fg_app||(d.top_procs&&d.top_procs.length));
+        if(isEmpty){noDataCount++;if(noDataCount>=2){showNoData();}return;}
+        noDataCount=0;
         failCount=0;
+        let as=document.getElementById("adbStatus");if(as)as.style.display="none";
         history.push(d);if(history.length>MAX_HISTORY)history.shift();
         checkAlerts(d.top_procs);
         if(currentTab==='dashboard'){
@@ -2221,10 +2714,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if new_mode in ("monitor", "test"):
                 MODE = new_mode
                 save_mode()
-                self._json({"mode": MODE})
-                do_restart()  # 响应后再重启
-            else:
-                self._json({"mode": MODE})
+            self._json({"mode": MODE})
 
         elif parsed.path == "/mode/state":
             self._json({"mode": MODE})
@@ -2280,6 +2770,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
         elif parsed.path == "/cpugov":
             self._json(get_cpu_governor())
+
+        elif parsed.path == "/sysopt/status":
+            self._json(get_sysopt_status())
 
         elif parsed.path == "/gpuinfo":
             self._json(get_gpu_info())
@@ -2416,6 +2909,25 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
         elif parsed.path == "/screenshot/take":
             self._json(take_screenshot())
+
+        elif parsed.path == "/perfmode/set":
+            mode = qs.get("mode",[""])[0]
+            option = qs.get("option",[""])[0]
+            self._json(set_perf_mode(mode, option))
+
+        elif parsed.path == "/perfmode/status":
+            self._json(get_perf_mode_status())
+
+        elif parsed.path == "/sysopt/set":
+            content_len = int(self.headers.get('Content-Length', 0))
+            body = self.rfile.read(content_len) if content_len > 0 else b'{}'
+            data = json.loads(body.decode())
+            setting = data.get("setting", "")
+            value = data.get("value", "")
+            self._json(set_sysopt_setting(setting, value))
+
+        elif parsed.path == "/sysopt/oneshot":
+            self._json(set_sysopt_oneshot())
 
         else:
             self._json({"ok":False,"error":"unknown endpoint"})
